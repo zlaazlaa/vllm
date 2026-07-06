@@ -31,6 +31,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.startup_profiling import startup_profile
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -240,85 +241,99 @@ class EngineCore:
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
 
-        # register all kvcache specs in enginecore process.
-        register_all_kvcache_specs(vllm_config)
-
-        # Get all kv cache needed by the model
-        kv_cache_specs = self.model_executor.get_kv_cache_specs()
-
-        # Some layers (e.g. Prefix LM attention) run non-causally and tag their
-        # KV cache spec with ``non_causal=True``. The specs are collected here in
-        # the engine-core process (the same process that builds the scheduler),
-        # so this is the multiproc-safe place to translate that layer-level
-        # signal into a scheduling policy: chunked prefill and prefix caching
-        # both assume causal attention and would corrupt non-causal prefill.
-        if any(
-            getattr(spec, "non_causal", False)
-            for worker_specs in kv_cache_specs
-            for spec in worker_specs.values()
+        with startup_profile(
+            "kv_cache_initialize",
+            model=vllm_config.model_config.model,
+            tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+            pipeline_parallel_size=vllm_config.parallel_config.pipeline_parallel_size,
         ):
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.info(
-                    "Disabling chunked prefill: model has non-causal attention layers."
-                )
-                vllm_config.scheduler_config.enable_chunked_prefill = False
-            if vllm_config.cache_config.enable_prefix_caching:
-                logger.info(
-                    "Disabling prefix caching: model has non-causal attention layers."
-                )
-                vllm_config.cache_config.enable_prefix_caching = False
+            # register all kvcache specs in enginecore process.
+            register_all_kvcache_specs(vllm_config)
 
-        has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
-        if has_kv_cache:
-            if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
-                # NOTE(yongji): should already be set
-                # during _eep_scale_up_before_kv_init
-                assert self.available_gpu_memory_for_kv_cache > 0
-                available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
-                    kv_cache_specs
-                )
+            # Get all kv cache needed by the model
+            kv_cache_specs = self.model_executor.get_kv_cache_specs()
+
+            # Some layers (e.g. Prefix LM attention) run non-causally and tag their
+            # KV cache spec with ``non_causal=True``. The specs are collected here in
+            # the engine-core process (the same process that builds the scheduler),
+            # so this is the multiproc-safe place to translate that layer-level
+            # signal into a scheduling policy: chunked prefill and prefix caching
+            # both assume causal attention and would corrupt non-causal prefill.
+            if any(
+                getattr(spec, "non_causal", False)
+                for worker_specs in kv_cache_specs
+                for spec in worker_specs.values()
+            ):
+                if vllm_config.scheduler_config.enable_chunked_prefill:
+                    logger.info(
+                        "Disabling chunked prefill: model has non-causal "
+                        "attention layers."
+                    )
+                    vllm_config.scheduler_config.enable_chunked_prefill = False
+                if vllm_config.cache_config.enable_prefix_caching:
+                    logger.info(
+                        "Disabling prefix caching: model has non-causal "
+                        "attention layers."
+                    )
+                    vllm_config.cache_config.enable_prefix_caching = False
+
+            has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
+            if has_kv_cache:
+                if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                    # NOTE(yongji): should already be set
+                    # during _eep_scale_up_before_kv_init
+                    assert self.available_gpu_memory_for_kv_cache > 0
+                    available_gpu_memory = [
+                        self.available_gpu_memory_for_kv_cache
+                    ] * len(kv_cache_specs)
+                else:
+                    # Profiles the peak memory usage of the model to determine how
+                    # much memory can be allocated for kv cache.
+                    available_gpu_memory = (
+                        self.model_executor.determine_available_memory()
+                    )
+                    self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
             else:
-                # Profiles the peak memory usage of the model to determine how
-                # much memory can be allocated for kv cache.
-                available_gpu_memory = self.model_executor.determine_available_memory()
-                self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
-        else:
-            # Attention free models don't need memory for kv cache
-            available_gpu_memory = [0] * len(kv_cache_specs)
+                # Attention free models don't need memory for kv cache
+                available_gpu_memory = [0] * len(kv_cache_specs)
 
-        assert len(kv_cache_specs) == len(available_gpu_memory)
+            assert len(kv_cache_specs) == len(available_gpu_memory)
 
-        # Track max_model_len before KV cache config to detect auto-fit changes
-        max_model_len_before = vllm_config.model_config.max_model_len
+            # Track max_model_len before KV cache config to detect auto-fit changes
+            max_model_len_before = vllm_config.model_config.max_model_len
 
-        kv_cache_configs = get_kv_cache_configs(
-            vllm_config, kv_cache_specs, available_gpu_memory
-        )
-
-        # If auto-fit reduced max_model_len, sync the new value to workers.
-        # This is needed because workers were spawned before memory profiling
-        # and have the original (larger) max_model_len cached.
-        max_model_len_after = vllm_config.model_config.max_model_len
-        if max_model_len_after != max_model_len_before:
-            self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
-
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-        vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
-        kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
-        if kv_cache_groups:
-            vllm_config.cache_config.block_size = min(
-                g.kv_cache_spec.block_size for g in kv_cache_groups
+            kv_cache_configs = get_kv_cache_configs(
+                vllm_config, kv_cache_specs, available_gpu_memory
             )
-            num_tokens, max_concurrency = get_kv_cache_capacity(
-                vllm_config, scheduler_kv_cache_config
+
+            # If auto-fit reduced max_model_len, sync the new value to workers.
+            # This is needed because workers were spawned before memory profiling
+            # and have the original (larger) max_model_len cached.
+            max_model_len_after = vllm_config.model_config.max_model_len
+            if max_model_len_after != max_model_len_before:
+                self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
+
+            scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+                kv_cache_configs
             )
-            vllm_config.cache_config.kv_cache_size_tokens = num_tokens
-            vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
+            vllm_config.cache_config.num_gpu_blocks = (
+                scheduler_kv_cache_config.num_blocks
+            )
+            kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
+            if kv_cache_groups:
+                vllm_config.cache_config.block_size = min(
+                    g.kv_cache_spec.block_size for g in kv_cache_groups
+                )
+                num_tokens, max_concurrency = get_kv_cache_capacity(
+                    vllm_config, scheduler_kv_cache_config
+                )
+                vllm_config.cache_config.kv_cache_size_tokens = num_tokens
+                vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
 
-        vllm_config.validate_block_size()
+            vllm_config.validate_block_size()
 
-        # Initialize kv cache and warmup the execution
-        self.model_executor.initialize_from_config(kv_cache_configs)
+            # Initialize kv cache and warmup the execution
+            self.model_executor.initialize_from_config(kv_cache_configs)
 
         elapsed = time.time() - start
         compile_time = vllm_config.compilation_config.compilation_time

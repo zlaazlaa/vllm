@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.reload import (
     set_torchao_reload_attrs,
 )
 from vllm.model_executor.models.interfaces import SupportsQuant
+from vllm.startup_profiling import startup_profile
 from vllm.tracing import instrument
 from vllm.utils.mem_utils import release_device_memory_under_pressure
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -101,44 +102,50 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    for _, module in model.named_modules():
-        quant_method = getattr(module, "quant_method", None)
-        if isinstance(quant_method, QuantizeMethodBase):
-            # When quant methods need to process weights after loading
-            # (for repacking, quantizing, etc), they expect parameters
-            # to be on the global target device. This scope is for the
-            # case where cpu offloading is used, where we will move the
-            # parameters onto device for processing and back off after.
-            with device_loading_context(module, target_device):
-                quant_method.process_weights_after_loading(module)
-            # Repacking transients above can leave large amounts of memory in
-            # the caching allocator, which starves the OS on UMA devices.
-            release_device_memory_under_pressure(target_device)
+    with startup_profile(
+        "process_weights_after_loading",
+        target_device=str(target_device),
+        quantization=model_config.quantization,
+    ):
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, QuantizeMethodBase):
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+                # Repacking transients above can leave large amounts of memory in
+                # the caching allocator, which starves the OS on UMA devices.
+                release_device_memory_under_pressure(target_device)
 
-    # Initialize post-load attention weights for Attention, MLA, and MM encoder.
-    # NOTE: Happens after other modules so we can easily decompress weights.
-    for _, module in model.named_modules():
-        if isinstance(
-            module, (Attention, MLAAttention, MMEncoderAttention)
-        ) and hasattr(module, "process_weights_after_loading"):
-            # TODO(lucas): see if there is a way to unify the signatures
-            # of process_weights_after_loading
-            with device_loading_context(module, target_device):
-                module.process_weights_after_loading(model_config.dtype)
+        # Initialize post-load attention weights for Attention, MLA, and MM encoder.
+        # NOTE: Happens after other modules so we can easily decompress weights.
+        for _, module in model.named_modules():
+            if isinstance(
+                module, (Attention, MLAAttention, MMEncoderAttention)
+            ) and hasattr(module, "process_weights_after_loading"):
+                # TODO(lucas): see if there is a way to unify the signatures
+                # of process_weights_after_loading
+                with device_loading_context(module, target_device):
+                    module.process_weights_after_loading(model_config.dtype)
 
-    # Process HPC modules (HpcRopeNorm, etc.) that rely on
-    # process_weights_after_loading being called from the model's
-    # load_weights(). When using DummyModelLoader (e.g. profiling or
-    # sleep/wake_up reload), the model's load_weights() is not called, so we
-    # must handle HPC modules here generically.
-    for _, module in model.named_modules():
-        if isinstance(module, HpcModule):
-            module.process_weights_after_loading(model)
+        # Process HPC modules (HpcRopeNorm, etc.) that rely on
+        # process_weights_after_loading being called from the model's
+        # load_weights(). When using DummyModelLoader (e.g. profiling or
+        # sleep/wake_up reload), the model's load_weights() is not called, so we
+        # must handle HPC modules here generically.
+        for _, module in model.named_modules():
+            if isinstance(module, HpcModule):
+                module.process_weights_after_loading(model)
 
-    # Needed for torchao model reloading via model.reload_weights
-    # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
-    if model_config.quantization == "torchao":
-        set_torchao_reload_attrs(model, model_config)
+        # Needed for torchao model reloading via model.reload_weights
+        # @kylesayrs @jerryzh168 this can be removed if callers move to
+        # `reload_weights`
+        if model_config.quantization == "torchao":
+            set_torchao_reload_attrs(model, model_config)
 
 
 @contextmanager

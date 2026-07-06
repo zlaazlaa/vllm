@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.startup_profiling import startup_profile
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
@@ -315,8 +316,19 @@ class DefaultModelLoader(BaseModelLoader):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
-        # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+        def profiled_weights_iterator():
+            with startup_profile(
+                "checkpoint_iterator",
+                load_format=str(self.load_config.load_format),
+                use_safetensors=use_safetensors,
+                weight_file_count=len(hf_weights_files),
+                prefix=source.prefix,
+            ):
+                for name, tensor in weights_iterator:
+                    yield source.prefix + name, tensor
+
+        return profiled_weights_iterator()
 
     def get_all_weights(
         self,
@@ -424,7 +436,14 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        with startup_profile(
+            "model_load_weights",
+            model=model_config.model,
+            load_format=str(self.load_config.load_format),
+        ):
+            loaded_weights = model.load_weights(
+                self.get_all_weights(model_config, model)
+            )
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

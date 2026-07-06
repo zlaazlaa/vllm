@@ -51,6 +51,7 @@ from vllm.distributed.utils import (
     get_cached_tcp_store_client,
 )
 from vllm.logger import init_logger
+from vllm.startup_profiling import startup_profile
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_distributed_init_method
 from vllm.utils.system_utils import suppress_stdout
@@ -406,37 +407,43 @@ class GroupCoordinator:
 
         # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the new ``split_group``
         # codepath. Default (False) preserves the legacy ``new_group`` path.
-        if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
-            self_device_group, self_cpu_group = _create_subgroups_split_group(
-                group_ranks, group_name, torch_distributed_backend
-            )
-            for ranks in group_ranks:
-                if self.rank in ranks:
-                    self.ranks = ranks
-                    self.world_size = len(ranks)
-                    self.rank_in_group = ranks.index(self.rank)
-                    break
-        else:
-            from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
-
-            timeout = get_cpu_distributed_timeout_or_none()
-
-            for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+        with startup_profile(
+            "process_group_create",
+            group_name=group_name,
+            group_count=len(group_ranks),
+            use_split_group=envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP,
+        ):
+            if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+                self_device_group, self_cpu_group = _create_subgroups_split_group(
+                    group_ranks, group_name, torch_distributed_backend
                 )
-                # a group with `gloo` backend, to allow direct coordination between
-                # processes through the CPU.
-                with suppress_stdout():
-                    cpu_group = torch.distributed.new_group(
-                        ranks, backend="gloo", timeout=timeout
+                for ranks in group_ranks:
+                    if self.rank in ranks:
+                        self.ranks = ranks
+                        self.world_size = len(ranks)
+                        self.rank_in_group = ranks.index(self.rank)
+                        break
+            else:
+                from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
+
+                timeout = get_cpu_distributed_timeout_or_none()
+
+                for ranks in group_ranks:
+                    device_group = torch.distributed.new_group(
+                        ranks, backend=torch_distributed_backend
                     )
-                if self.rank in ranks:
-                    self.ranks = ranks
-                    self.world_size = len(ranks)
-                    self.rank_in_group = ranks.index(self.rank)
-                    self_device_group = device_group
-                    self_cpu_group = cpu_group
+                    # a group with `gloo` backend, to allow direct coordination between
+                    # processes through the CPU.
+                    with suppress_stdout():
+                        cpu_group = torch.distributed.new_group(
+                            ranks, backend="gloo", timeout=timeout
+                        )
+                    if self.rank in ranks:
+                        self.ranks = ranks
+                        self.world_size = len(ranks)
+                        self.rank_in_group = ranks.index(self.rank)
+                        self_device_group = device_group
+                        self_cpu_group = cpu_group
 
         assert self_cpu_group is not None
         assert self_device_group is not None
@@ -471,12 +478,20 @@ class GroupCoordinator:
             device_comm_cls = resolve_obj_by_qualname(
                 current_platform.get_device_communicator_cls()
             )
-            self.device_communicator = device_comm_cls(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
+            with startup_profile(
+                "device_communicator_create",
+                group_name=group_name,
                 unique_name=self.unique_name,
-            )
+                world_size=self.world_size,
+                device=str(self.device),
+                communicator_cls=current_platform.get_device_communicator_cls(),
+            ):
+                self.device_communicator = device_comm_cls(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                )
 
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -1284,14 +1299,22 @@ def init_model_parallel_group(
     group_name: str | None = None,
     use_device_communicator: bool = True,
 ) -> GroupCoordinator:
-    return GroupCoordinator(
-        group_ranks=group_ranks,
-        local_rank=local_rank,
-        torch_distributed_backend=backend,
+    with startup_profile(
+        "model_parallel_group_create",
+        group_name=group_name or "anonymous",
+        group_count=len(group_ranks),
+        group_world_size=len(group_ranks[0]) if group_ranks else 0,
+        backend=str(backend),
         use_device_communicator=use_device_communicator,
-        use_message_queue_broadcaster=use_message_queue_broadcaster,
-        group_name=group_name,
-    )
+    ):
+        return GroupCoordinator(
+            group_ranks=group_ranks,
+            local_rank=local_rank,
+            torch_distributed_backend=backend,
+            use_device_communicator=use_device_communicator,
+            use_message_queue_broadcaster=use_message_queue_broadcaster,
+            group_name=group_name,
+        )
 
 
 def _init_stateless_group(
@@ -1606,33 +1629,40 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
-        if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
-            # split_group needs local_rank early to compute device_id for
-            # the eager init. local_rank is not available in torch
-            # ProcessGroup, see https://github.com/pytorch/pytorch/issues/122816
-            if local_rank == -1:
-                local_rank = (
-                    int(envs.LOCAL_RANK)
-                    if distributed_init_method == "env://"
-                    else rank
+        with startup_profile(
+            "default_process_group_init",
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+            use_split_group=envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP,
+        ):
+            if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+                # split_group needs local_rank early to compute device_id for
+                # the eager init. local_rank is not available in torch
+                # ProcessGroup, see https://github.com/pytorch/pytorch/issues/122816
+                if local_rank == -1:
+                    local_rank = (
+                        int(envs.LOCAL_RANK)
+                        if distributed_init_method == "env://"
+                        else rank
+                    )
+                _init_process_group_for_split_group(
+                    backend=backend,
+                    distributed_init_method=distributed_init_method,
+                    world_size=world_size,
+                    rank=rank,
+                    local_rank=local_rank,
+                    timeout=timeout,
                 )
-            _init_process_group_for_split_group(
-                backend=backend,
-                distributed_init_method=distributed_init_method,
-                world_size=world_size,
-                rank=rank,
-                local_rank=local_rank,
-                timeout=timeout,
-            )
-        else:
-            # this backend is used for WORLD
-            torch.distributed.init_process_group(
-                backend=backend,
-                init_method=distributed_init_method,
-                world_size=world_size,
-                rank=rank,
-                timeout=timeout,
-            )
+            else:
+                # this backend is used for WORLD
+                torch.distributed.init_process_group(
+                    backend=backend,
+                    init_method=distributed_init_method,
+                    world_size=world_size,
+                    rank=rank,
+                    timeout=timeout,
+                )
         if enable_elastic_ep:
             tp_pp_cpu_group = torch.distributed.new_group(
                 backend="gloo", timeout=timeout
@@ -1987,18 +2017,22 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
     MoE all2all (DeepEP) usually allocate the communication buffer
     based on the model shape for optimal performance.
     """
-    if _TP is not None:
-        _TP.prepare_communication_buffer_for_model(model)
-    if _PCP is not None:
-        _PCP.prepare_communication_buffer_for_model(model)
-    if _PP is not None:
-        _PP.prepare_communication_buffer_for_model(model)
-    if _DP is not None:
-        _DP.prepare_communication_buffer_for_model(model)
-    if _EP is not None:
-        _EP.prepare_communication_buffer_for_model(model)
-    if _EPLB is not None:
-        _EPLB.prepare_communication_buffer_for_model(model)
+    groups = (
+        ("tp", _TP),
+        ("pcp", _PCP),
+        ("pp", _PP),
+        ("dp", _DP),
+        ("ep", _EP),
+        ("eplb", _EPLB),
+    )
+    for group_name, group in groups:
+        if group is not None:
+            with startup_profile(
+                "communication_buffer_prepare",
+                group_name=group_name,
+                world_size=group.world_size,
+            ):
+                group.prepare_communication_buffer_for_model(model)
 
 
 def model_parallel_is_initialized():

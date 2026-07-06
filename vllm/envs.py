@@ -237,6 +237,8 @@ if TYPE_CHECKING:
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
+    VLLM_STARTUP_PROFILING: bool = False
+    VLLM_STARTUP_PROFILE_DIR: str = ""
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -1740,6 +1742,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY": lambda: bool(
         int(os.getenv("VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY", "0"))
     ),
+    # Enable low-overhead startup phase timing for cold-start baseline capture.
+    "VLLM_STARTUP_PROFILING": lambda: bool(
+        int(os.getenv("VLLM_STARTUP_PROFILING", "0"))
+    ),
+    # Directory for startup timing JSONL files. Empty keeps events in process only.
+    "VLLM_STARTUP_PROFILE_DIR": lambda: os.getenv("VLLM_STARTUP_PROFILE_DIR", ""),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(
         int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))
