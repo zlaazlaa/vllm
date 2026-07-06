@@ -46,6 +46,12 @@ import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
+from vllm.distributed.topology_cache import (
+    TopologyDescriptor,
+    TopologyGroupLayout,
+    TopologyStateCache,
+    plan_topology_groups,
+)
 from vllm.distributed.utils import (
     StatelessProcessGroup,
     get_cached_tcp_store_client,
@@ -1398,6 +1404,9 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
+_MODEL_PARALLEL_TOPOLOGY_CACHE: TopologyStateCache[GroupCoordinator] | None = None
+
+
 _EP: GroupCoordinator | None = None
 
 
@@ -2010,6 +2019,94 @@ def ensure_model_parallel_initialized(
     )
 
 
+def plan_model_parallel_groups(
+    *,
+    world_size: int,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
+    data_parallel_size: int = 1,
+) -> TopologyGroupLayout:
+    descriptor = TopologyDescriptor(
+        world_size=world_size,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+        decode_context_parallel_size=decode_context_parallel_size,
+        data_parallel_size=data_parallel_size,
+    )
+    return plan_topology_groups(descriptor)
+
+
+def _get_model_parallel_topology_backend(backend: str | None) -> str:
+    if backend is not None:
+        return backend
+    world_group = get_world_group()
+    if hasattr(world_group, "backend"):
+        return world_group.backend
+    return torch.distributed.get_backend(world_group.device_group)
+
+
+def _get_or_create_model_parallel_topology_cache(
+    backend: str | None,
+) -> TopologyStateCache[GroupCoordinator]:
+    global _MODEL_PARALLEL_TOPOLOGY_CACHE
+    if _MODEL_PARALLEL_TOPOLOGY_CACHE is not None:
+        return _MODEL_PARALLEL_TOPOLOGY_CACHE
+
+    resolved_backend = _get_model_parallel_topology_backend(backend)
+
+    def build_group(group_name: str, group_ranks: list[list[int]]) -> GroupCoordinator:
+        return init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            resolved_backend,
+            use_message_queue_broadcaster=group_name in ("tp", "dcp"),
+            group_name=group_name,
+        )
+
+    _MODEL_PARALLEL_TOPOLOGY_CACHE = TopologyStateCache(build_group)
+    return _MODEL_PARALLEL_TOPOLOGY_CACHE
+
+
+def prebuild_model_parallel_topologies(
+    descriptors: list[TopologyDescriptor],
+    backend: str | None = None,
+) -> None:
+    cache = _get_or_create_model_parallel_topology_cache(backend)
+    for descriptor in descriptors:
+        cache.prebuild(descriptor)
+
+
+def activate_model_parallel_topology(descriptor: TopologyDescriptor) -> None:
+    if _MODEL_PARALLEL_TOPOLOGY_CACHE is None:
+        raise RuntimeError("model parallel topology cache is not initialized")
+
+    snapshot = _MODEL_PARALLEL_TOPOLOGY_CACHE.activate(descriptor)
+
+    global _TP, _DCP, _PCP, _PP, _DP
+    _TP = snapshot.tp
+    _DCP = snapshot.dcp
+    _PCP = snapshot.pcp
+    _PP = snapshot.pp
+    _DP = snapshot.dp
+
+
+def destroy_model_parallel_topology_cache() -> None:
+    global _MODEL_PARALLEL_TOPOLOGY_CACHE
+    if _MODEL_PARALLEL_TOPOLOGY_CACHE is not None:
+        _MODEL_PARALLEL_TOPOLOGY_CACHE.destroy()
+    _MODEL_PARALLEL_TOPOLOGY_CACHE = None
+
+    global _TP, _DCP, _PCP, _PP, _DP
+    _TP = None
+    _DCP = None
+    _PCP = None
+    _PP = None
+    _DP = None
+
+
 def prepare_communication_buffer_for_model(model: torch.nn.Module):
     """Prepare the communication buffer for the model.
     Traditional communication libraries like NCCL are almost
@@ -2061,6 +2158,9 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    if _MODEL_PARALLEL_TOPOLOGY_CACHE is not None:
+        destroy_model_parallel_topology_cache()
+
     global _TP
 
     if _TP:
