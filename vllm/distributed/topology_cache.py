@@ -130,6 +130,61 @@ def plan_topology_groups(descriptor: TopologyDescriptor) -> TopologyGroupLayout:
     return TopologyGroupLayout(tp=tp, dcp=dcp, pcp=pcp, pp=pp, dp=dp)
 
 
+def parse_topology_descriptors(
+    spec: str,
+    *,
+    world_size: int,
+    data_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
+) -> list[TopologyDescriptor]:
+    if not spec.strip():
+        return []
+
+    aliases = {
+        "tp": "tensor_parallel_size",
+        "tensor_parallel_size": "tensor_parallel_size",
+        "pp": "pipeline_parallel_size",
+        "pipeline_parallel_size": "pipeline_parallel_size",
+        "pcp": "prefill_context_parallel_size",
+        "prefill_context_parallel_size": "prefill_context_parallel_size",
+        "dcp": "decode_context_parallel_size",
+        "decode_context_parallel_size": "decode_context_parallel_size",
+        "dp": "data_parallel_size",
+        "data_parallel_size": "data_parallel_size",
+    }
+    descriptors: list[TopologyDescriptor] = []
+    for entry in spec.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+
+        values = {
+            "world_size": world_size,
+            "data_parallel_size": data_parallel_size,
+            "prefill_context_parallel_size": prefill_context_parallel_size,
+            "decode_context_parallel_size": decode_context_parallel_size,
+        }
+        for item in entry.split(","):
+            if "=" not in item:
+                raise ValueError(f"invalid topology field {item!r}")
+            raw_key, raw_value = item.split("=", 1)
+            key = raw_key.strip()
+            if key not in aliases:
+                raise ValueError(f"unknown topology field {key!r}")
+            try:
+                value = int(raw_value.strip())
+            except ValueError as e:
+                raise ValueError(
+                    f"topology field {key!r} must be an integer"
+                ) from e
+            values[aliases[key]] = value
+
+        descriptors.append(TopologyDescriptor(**values))
+
+    return descriptors
+
+
 @dataclass
 class TopologyGroupSnapshot(Generic[GroupT]):
     descriptor: TopologyDescriptor

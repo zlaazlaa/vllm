@@ -13,6 +13,7 @@ import torch.distributed
 from vllm.distributed.topology_cache import (
     TopologyDescriptor,
     TopologyStateCache,
+    parse_topology_descriptors,
     plan_topology_groups,
 )
 
@@ -22,6 +23,8 @@ class FakeGroup:
     def __init__(self, name: str, ranks: list[list[int]]) -> None:
         self.name = name
         self.ranks = ranks
+        self.world_size = len(ranks[0]) if ranks else 0
+        self.rank_in_group = 0
         self.destroyed = False
 
     def destroy(self) -> None:
@@ -114,6 +117,31 @@ def test_plan_rejects_decode_context_that_does_not_divide_tensor_parallel() -> N
             pipeline_parallel_size=2,
             decode_context_parallel_size=2,
         )
+
+
+def test_parse_topology_descriptors_from_spec() -> None:
+    descriptors = parse_topology_descriptors(
+        "tp=1,pp=2; tp=2,pp=1,dcp=1,pcp=1",
+        world_size=2,
+    )
+
+    assert descriptors == [
+        TopologyDescriptor(
+            world_size=2,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+        ),
+        TopologyDescriptor(
+            world_size=2,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+        ),
+    ]
+
+
+def test_parse_topology_descriptors_rejects_unknown_key() -> None:
+    with pytest.raises(ValueError, match="unknown topology field"):
+        parse_topology_descriptors("tp=2,foo=1", world_size=2)
 
 
 def test_cache_prebuilds_once_and_activate_does_not_create_groups() -> None:
@@ -307,6 +335,147 @@ def test_destroy_model_parallel_destroys_topology_cache(monkeypatch) -> None:
     assert all(snapshot.destroyed for snapshot in snapshots)
 
 
+def test_parallel_state_prebuilds_env_topologies_and_activates_current(
+    monkeypatch,
+) -> None:
+    from vllm.distributed import parallel_state
+
+    builder = RecordingGroupBuilder()
+
+    def fake_init_model_parallel_group(
+        group_ranks,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=False,
+        group_name=None,
+        use_device_communicator=True,
+    ):
+        return builder(group_name, group_ranks)
+
+    monkeypatch.setenv(
+        "VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES",
+        "tp=1,pp=2",
+    )
+    monkeypatch.setattr(
+        parallel_state, "init_model_parallel_group", fake_init_model_parallel_group
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: type("World", (), {"local_rank": 0})(),
+    )
+    monkeypatch.setattr(parallel_state, "_TP", None)
+    monkeypatch.setattr(parallel_state, "_DCP", None)
+    monkeypatch.setattr(parallel_state, "_PCP", None)
+    monkeypatch.setattr(parallel_state, "_PP", None)
+    monkeypatch.setattr(parallel_state, "_DP", None)
+    monkeypatch.setattr(parallel_state, "_MODEL_PARALLEL_TOPOLOGY_CACHE", None)
+
+    prebuilt = parallel_state.maybe_prebuild_model_parallel_topologies_from_env(
+        world_size=2,
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=1,
+        backend="gloo",
+    )
+
+    assert prebuilt
+    assert len(builder.calls) == 10
+    assert parallel_state.get_tp_group().ranks == [[0, 1]]
+    assert parallel_state.get_pp_group().ranks == [[0], [1]]
+
+    created_count = len(builder.calls)
+    parallel_state.ensure_model_parallel_initialized(2, 1, 1, 1, backend="gloo")
+    assert len(builder.calls) == created_count
+
+
+def test_worker_prebuilds_env_topologies_before_ensuring_current(
+    monkeypatch,
+) -> None:
+    from vllm.model_executor.layers import batch_invariant
+    from vllm.v1.worker import gpu_worker
+
+    events: list[str] = []
+
+    class ParallelConfig:
+        disable_custom_all_reduce = False
+        distributed_timeout_seconds = None
+        world_size = 2
+        tensor_parallel_size = 2
+        pipeline_parallel_size = 1
+        prefill_context_parallel_size = 1
+        decode_context_parallel_size = 1
+        data_parallel_size = 1
+
+    class KernelConfig:
+        moe_backend = None
+
+    class VllmConfig:
+        parallel_config = ParallelConfig()
+        kernel_config = KernelConfig()
+
+    def fake_prebuild(**kwargs):
+        events.append(f"prebuild:{kwargs['world_size']}:{kwargs['backend']}")
+        return True
+
+    monkeypatch.setattr(
+        batch_invariant,
+        "init_batch_invariance",
+        lambda: events.append("batch_invariance"),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "override_envs_for_eplb",
+        lambda *args, **kwargs: events.append("override_eplb"),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "set_custom_all_reduce",
+        lambda enabled: events.append(f"custom_all_reduce:{enabled}"),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "init_distributed_environment",
+        lambda *args, **kwargs: events.append("init_distributed"),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "maybe_prebuild_model_parallel_topologies_from_env",
+        fake_prebuild,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "ensure_model_parallel_initialized",
+        lambda *args, **kwargs: events.append("ensure_model_parallel"),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "ensure_ec_transfer_initialized",
+        lambda config: events.append("ensure_ec"),
+    )
+
+    gpu_worker.init_worker_distributed_environment(
+        VllmConfig(),
+        rank=0,
+        distributed_init_method="file:///tmp/test",
+        local_rank=0,
+        backend="gloo",
+    )
+
+    assert events == [
+        "batch_invariance",
+        "override_eplb",
+        "custom_all_reduce:True",
+        "init_distributed",
+        "prebuild:2:gloo",
+        "ensure_model_parallel",
+        "ensure_ec",
+    ]
+
+
 def _gloo_cache_worker(
     rank: int, world_size: int, rendezvous_path: str, queue
 ) -> None:
@@ -491,6 +660,96 @@ def test_nccl_cache_activation_does_not_create_new_groups(tmp_path: Path) -> Non
     processes = [
         ctx.Process(
             target=_nccl_cache_worker,
+            args=(rank, world_size, rendezvous_path, queue),
+        )
+        for rank in range(world_size)
+    ]
+
+    for process in processes:
+        process.start()
+
+    errors = [queue.get(timeout=120) for _ in processes]
+
+    for process in processes:
+        process.join(timeout=120)
+
+    for process in processes:
+        assert process.exitcode == 0
+
+    assert errors == [None, None]
+
+
+def _nccl_worker_startup_prebuild_worker(
+    rank: int, world_size: int, rendezvous_path: str, queue
+) -> None:
+    try:
+        from vllm.distributed import parallel_state
+        from vllm.model_executor.layers import batch_invariant
+        from vllm.v1.worker import gpu_worker
+
+        configured_world_size = world_size
+
+        class ParallelConfig:
+            disable_custom_all_reduce = True
+            distributed_timeout_seconds = 60
+            world_size = configured_world_size
+            tensor_parallel_size = 2
+            pipeline_parallel_size = 1
+            prefill_context_parallel_size = 1
+            decode_context_parallel_size = 1
+            data_parallel_size = 1
+
+        class KernelConfig:
+            moe_backend = None
+
+        class VllmConfig:
+            parallel_config = ParallelConfig()
+            kernel_config = KernelConfig()
+
+        os.environ["VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES"] = "tp=1,pp=2"
+        torch.cuda.set_device(rank)
+
+        batch_invariant.init_batch_invariance = lambda: None
+        gpu_worker.override_envs_for_eplb = lambda *args, **kwargs: None
+        gpu_worker.ensure_ec_transfer_initialized = lambda config: None
+
+        gpu_worker.init_worker_distributed_environment(
+            VllmConfig(),
+            rank=rank,
+            distributed_init_method=f"file://{rendezvous_path}",
+            local_rank=rank,
+            backend="nccl",
+        )
+
+        cache = parallel_state._MODEL_PARALLEL_TOPOLOGY_CACHE
+        assert cache is not None
+        assert len(cache._snapshots) == 2
+
+        tensor = torch.ones(1, device=f"cuda:{rank}")
+        torch.distributed.all_reduce(
+            tensor, group=parallel_state.get_tp_group().device_group
+        )
+        assert tensor.item() == world_size
+
+        parallel_state.destroy_model_parallel()
+        parallel_state.destroy_distributed_environment()
+        queue.put(None)
+    except Exception:
+        queue.put(traceback.format_exc())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="Need at least 2 CUDA GPUs to run the NCCL worker startup test.",
+)
+def test_worker_nccl_startup_prebuilds_env_topologies(tmp_path: Path) -> None:
+    world_size = 2
+    rendezvous_path = str(tmp_path / "worker_nccl_rendezvous")
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_nccl_worker_startup_prebuild_worker,
             args=(rank, world_size, rendezvous_path, queue),
         )
         for rank in range(world_size)

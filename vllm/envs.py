@@ -239,6 +239,7 @@ if TYPE_CHECKING:
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_STARTUP_PROFILING: bool = False
     VLLM_STARTUP_PROFILE_DIR: str = ""
+    VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES: str = ""
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -1748,6 +1749,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Directory for startup timing JSONL files. Empty keeps events in process only.
     "VLLM_STARTUP_PROFILE_DIR": lambda: os.getenv("VLLM_STARTUP_PROFILE_DIR", ""),
+    # Semicolon-separated candidate model-parallel topologies to prebuild.
+    # Example: "tp=1,pp=2;tp=2,pp=1".
+    "VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES": lambda: os.getenv(
+        "VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", ""
+    ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(
         int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))

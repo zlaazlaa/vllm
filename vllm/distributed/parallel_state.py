@@ -50,6 +50,7 @@ from vllm.distributed.topology_cache import (
     TopologyDescriptor,
     TopologyGroupLayout,
     TopologyStateCache,
+    parse_topology_descriptors,
     plan_topology_groups,
 )
 from vllm.distributed.utils import (
@@ -2077,6 +2078,47 @@ def prebuild_model_parallel_topologies(
     cache = _get_or_create_model_parallel_topology_cache(backend)
     for descriptor in descriptors:
         cache.prebuild(descriptor)
+
+
+def maybe_prebuild_model_parallel_topologies_from_env(
+    *,
+    world_size: int,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    prefill_context_parallel_size: int,
+    decode_context_parallel_size: int | None,
+    data_parallel_size: int,
+    backend: str | None = None,
+) -> bool:
+    topology_spec = envs.VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES
+    if not topology_spec:
+        return False
+
+    decode_context_parallel_size = decode_context_parallel_size or 1
+    active_descriptor = TopologyDescriptor(
+        world_size=world_size,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+        decode_context_parallel_size=decode_context_parallel_size,
+        data_parallel_size=data_parallel_size,
+    )
+    descriptors = [active_descriptor]
+    seen = {active_descriptor.key}
+    for descriptor in parse_topology_descriptors(
+        topology_spec,
+        world_size=world_size,
+        data_parallel_size=data_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+        decode_context_parallel_size=decode_context_parallel_size,
+    ):
+        if descriptor.key not in seen:
+            descriptors.append(descriptor)
+            seen.add(descriptor.key)
+
+    prebuild_model_parallel_topologies(descriptors, backend)
+    activate_model_parallel_topology(active_descriptor)
+    return True
 
 
 def activate_model_parallel_topology(descriptor: TopologyDescriptor) -> None:

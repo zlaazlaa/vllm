@@ -23,6 +23,7 @@ from vllm.device_allocator import get_mem_allocator_instance
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
+    maybe_prebuild_model_parallel_topologies_from_env,
     set_custom_all_reduce,
 )
 from vllm.distributed.ec_transfer import (
@@ -1281,6 +1282,21 @@ def init_worker_distributed_environment(
         local_rank,
         backend,
         timeout,
+    )
+
+    topology_world_size = (
+        torch.distributed.get_world_size()
+        if torch.distributed.is_initialized()
+        else parallel_config.world_size
+    )
+    maybe_prebuild_model_parallel_topologies_from_env(
+        world_size=topology_world_size,
+        tensor_parallel_size=parallel_config.tensor_parallel_size,
+        pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+        prefill_context_parallel_size=parallel_config.prefill_context_parallel_size,
+        decode_context_parallel_size=parallel_config.decode_context_parallel_size,
+        data_parallel_size=parallel_config.data_parallel_size,
+        backend=backend,
     )
 
     ensure_model_parallel_initialized(
