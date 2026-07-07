@@ -804,6 +804,17 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             reset_running_requests, reset_connector
         )
 
+    def switch_runtime_topology(
+        self,
+        *,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
+        return self.llm_engine.switch_runtime_topology(
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        )
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """
         Put the engine to sleep. The engine should not process any requests.

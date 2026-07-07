@@ -1545,6 +1545,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+    def clear_runtime_state_for_topology_rebuild(
+        self,
+        *,
+        clear_model: bool,
+    ) -> None:
+        torch.accelerator.synchronize()
+        if hasattr(self, "kv_caches"):
+            self.kv_caches.clear()
+        if hasattr(self, "attn_groups"):
+            self.attn_groups.clear()
+        if hasattr(self, "kv_cache_config"):
+            del self.kv_cache_config
+        if not clear_model:
+            return
+
+        free_before_shutdown(self.vllm_config)
+        if hasattr(self, "model_state"):
+            del self.model_state
+        if getattr(self, "speculator", None) is not None:
+            self.speculator = None
+        if hasattr(self, "model"):
+            del self.model
+
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""

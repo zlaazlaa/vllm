@@ -21,6 +21,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.device_allocator import get_mem_allocator_instance
 from vllm.distributed import (
+    activate_model_parallel_topology,
     ensure_model_parallel_initialized,
     init_distributed_environment,
     maybe_prebuild_model_parallel_topologies_from_env,
@@ -45,6 +46,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
+from vllm.distributed.topology_cache import TopologyDescriptor
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
     WeightTransferEngineFactory,
@@ -382,6 +384,13 @@ class Worker(WorkerBase):
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
+        self._init_model_runner()
+
+        if self.rank == 0:
+            # If usage stat is enabled, collect relevant info.
+            report_usage_stats(self.vllm_config)
+
+    def _init_model_runner(self) -> None:
         if self.use_v2_model_runner:
             from vllm.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
@@ -397,10 +406,6 @@ class Worker(WorkerBase):
             )
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
-
-        if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
-            report_usage_stats(self.vllm_config)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -426,6 +431,40 @@ class Worker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
+
+    def activate_model_parallel_topology(
+        self,
+        descriptor: TopologyDescriptor,
+    ) -> None:
+        activate_model_parallel_topology(descriptor)
+
+    def update_runtime_topology_config(
+        self,
+        descriptor: TopologyDescriptor,
+    ) -> None:
+        self.parallel_config.tensor_parallel_size = descriptor.tensor_parallel_size
+        self.parallel_config.pipeline_parallel_size = descriptor.pipeline_parallel_size
+        self.parallel_config.prefill_context_parallel_size = (
+            descriptor.prefill_context_parallel_size
+        )
+        self.parallel_config.decode_context_parallel_size = (
+            descriptor.decode_context_parallel_size
+        )
+        self.parallel_config.data_parallel_size = descriptor.data_parallel_size
+        self.parallel_config.world_size = descriptor.world_size
+        self.vllm_config.parallel_config = self.parallel_config
+
+    def rebuild_model_for_runtime_topology(self) -> None:
+        self.model_runner.clear_runtime_state_for_topology_rebuild(
+            clear_model=True
+        )
+        self._init_model_runner()
+        self.load_model()
+
+    def clear_runtime_kv_state(self) -> None:
+        self.model_runner.clear_runtime_state_for_topology_rebuild(
+            clear_model=False
+        )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

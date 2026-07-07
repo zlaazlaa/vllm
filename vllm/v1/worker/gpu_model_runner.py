@@ -6372,6 +6372,18 @@ class GPUModelRunner(
                 gc.unfreeze()
                 gc.collect()
 
+    def clear_runtime_state_for_topology_rebuild(
+        self,
+        *,
+        clear_model: bool,
+    ) -> None:
+        self._cleanup_profiling_kv_cache()
+        if not clear_model:
+            return
+
+        self.compilation_config.static_forward_context.clear()
+        self.model = None  # type: ignore[assignment]
+
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""

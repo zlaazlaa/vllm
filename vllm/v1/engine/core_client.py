@@ -48,6 +48,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.runtime_topology import RuntimeTopologySwitchRequest
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -66,6 +67,16 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+
+def _runtime_topology_switch_payload(
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+) -> dict[str, int]:
+    return {
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+    }
 
 
 class EngineCoreClient(ABC):
@@ -201,6 +212,13 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    def switch_runtime_topology(
+        self,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
+        raise NotImplementedError
+
     def dp_engines_running(self) -> bool:
         """Returns True if data parallel engines are collectively in a
         running state."""
@@ -270,6 +288,13 @@ class EngineCoreClient(ABC):
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
+        raise NotImplementedError
+
+    async def switch_runtime_topology_async(
+        self,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
         raise NotImplementedError
 
 
@@ -361,6 +386,18 @@ class InprocClient(EngineCoreClient):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+    def switch_runtime_topology(
+        self,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
+        return self.engine_core.switch_runtime_topology(
+            RuntimeTopologySwitchRequest(
+                tensor_parallel_size=tensor_parallel_size,
+                pipeline_parallel_size=pipeline_parallel_size,
+            )
+        )
 
     def dp_engines_running(self) -> bool:
         return False
@@ -941,6 +978,19 @@ class SyncMPClient(MPClient):
     ) -> list[_R]:
         return self.call_utility("collective_rpc", method, timeout, args, kwargs)
 
+    def switch_runtime_topology(
+        self,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
+        return self.call_utility(
+            "switch_runtime_topology",
+            _runtime_topology_switch_payload(
+                tensor_parallel_size,
+                pipeline_parallel_size,
+            ),
+        )
+
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
@@ -1194,6 +1244,19 @@ class AsyncMPClient(MPClient):
     ) -> list[_R]:
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
+        )
+
+    async def switch_runtime_topology_async(
+        self,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
+        return await self.call_utility_async(
+            "switch_runtime_topology",
+            _runtime_topology_switch_payload(
+                tensor_parallel_size,
+                pipeline_parallel_size,
+            ),
         )
 
 

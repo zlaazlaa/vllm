@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar, overload
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed.topology_cache import TopologyDescriptor
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
@@ -266,6 +267,30 @@ class Executor(ABC):
             "save_sharded_state",
             kwargs=dict(path=path, pattern=pattern, max_size=max_size),
         )
+
+    def activate_model_parallel_topology(
+        self,
+        descriptor: TopologyDescriptor,
+    ) -> None:
+        self.collective_rpc(
+            "activate_model_parallel_topology",
+            args=(descriptor,),
+        )
+
+    def update_runtime_topology_config(
+        self,
+        descriptor: TopologyDescriptor,
+    ) -> None:
+        self.collective_rpc(
+            "update_runtime_topology_config",
+            args=(descriptor,),
+        )
+
+    def rebuild_model_for_runtime_topology(self) -> None:
+        self.collective_rpc("rebuild_model_for_runtime_topology")
+
+    def clear_runtime_kv_state(self) -> None:
+        self.collective_rpc("clear_runtime_kv_state")
 
     @abstractmethod
     def check_health(self) -> None:

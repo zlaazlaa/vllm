@@ -975,6 +975,17 @@ class AsyncLLM(EngineClient):
             method, timeout, args, kwargs
         )
 
+    async def switch_runtime_topology(
+        self,
+        *,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
+        return await self.engine_core.switch_runtime_topology_async(
+            tensor_parallel_size,
+            pipeline_parallel_size,
+        )
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()

@@ -40,6 +40,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     model_parallel_is_initialized,
 )
+from vllm.distributed.topology_cache import TopologyDescriptor
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -530,6 +531,27 @@ class MultiprocExecutor(Executor):
             - self.parallel_config.tensor_parallel_size
             * self.parallel_config.prefill_context_parallel_size
         )
+
+    def update_runtime_topology_config(
+        self,
+        descriptor: TopologyDescriptor,
+    ) -> None:
+        self.parallel_config.world_size = descriptor.world_size
+        self.parallel_config.tensor_parallel_size = descriptor.tensor_parallel_size
+        self.parallel_config.pipeline_parallel_size = (
+            descriptor.pipeline_parallel_size
+        )
+        self.parallel_config.prefill_context_parallel_size = (
+            descriptor.prefill_context_parallel_size
+        )
+        self.parallel_config.decode_context_parallel_size = (
+            descriptor.decode_context_parallel_size
+        )
+        self.parallel_config.data_parallel_size = descriptor.data_parallel_size
+        self.vllm_config.parallel_config = self.parallel_config
+        self.world_size = descriptor.world_size
+        self.output_rank = self._get_output_rank()
+        super().update_runtime_topology_config(descriptor)
 
     @classmethod
     def supports_async_scheduling(cls) -> bool:

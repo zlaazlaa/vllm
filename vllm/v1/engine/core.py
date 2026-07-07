@@ -70,6 +70,13 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.runtime_topology import (
+    RuntimeTopologySwitchRequest,
+    apply_runtime_topology_to_config,
+    collect_runtime_topology_keys,
+    topology_descriptor_to_dict,
+    validate_runtime_topology_switch,
+)
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -236,6 +243,108 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+    def _rebuild_scheduler_for_runtime_topology(
+        self,
+        kv_cache_config: KVCacheConfig,
+        drained_requests: list[Request],
+    ) -> None:
+        include_finished_set = getattr(
+            self.scheduler,
+            "finished_req_ids_dict",
+            None,
+        ) is not None
+        Scheduler = self.vllm_config.scheduler_config.get_scheduler_cls()
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, self.vllm_config
+        )
+        self.scheduler = Scheduler(
+            vllm_config=self.vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=include_finished_set,
+            log_stats=self.log_stats,
+            block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+        )
+        if (
+            self.vllm_config.cache_config.enable_prefix_caching
+            or self.scheduler.get_kv_connector() is not None
+        ):
+            caching_hash_fn = get_hash_fn_by_name(
+                self.vllm_config.cache_config.prefix_caching_hash_algo
+            )
+            init_none_hash(caching_hash_fn)
+            self.request_block_hasher = get_request_block_hasher(
+                hash_block_size,
+                caching_hash_fn,
+            )
+        else:
+            self.request_block_hasher = None
+
+        if self.scheduler.connector is not None:  # type: ignore
+            self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+        for request in drained_requests:
+            self.scheduler.add_request(request)
+
+    def switch_runtime_topology(
+        self,
+        request: RuntimeTopologySwitchRequest | dict[str, int],
+    ) -> dict[str, dict[str, int]]:
+        if isinstance(request, dict):
+            request = RuntimeTopologySwitchRequest(**request)
+        prebuilt_topology_keys = getattr(
+            self,
+            "_runtime_topology_prebuilt_keys",
+            None,
+        )
+        if prebuilt_topology_keys is None:
+            prebuilt_topology_keys = collect_runtime_topology_keys(
+                self.vllm_config
+            )
+            self._runtime_topology_prebuilt_keys = prebuilt_topology_keys
+        plan = validate_runtime_topology_switch(
+            self.vllm_config,
+            request,
+            prebuilt_topology_keys,
+        )
+
+        self.pause_scheduler(mode="keep", clear_cache=False)
+        try:
+            batch_queue = getattr(self, "batch_queue", None)
+            if batch_queue is not None:
+                batch_queue.clear()
+            drained_requests = (
+                self.scheduler.drain_unfinished_requests_for_recompute(
+                    reset_running_requests=True
+                )
+            )
+            apply_runtime_topology_to_config(
+                self.vllm_config,
+                plan.target_topology,
+            )
+            self.model_executor.update_runtime_topology_config(
+                plan.target_topology
+            )
+            self.model_executor.activate_model_parallel_topology(
+                plan.target_topology
+            )
+            self.model_executor.rebuild_model_for_runtime_topology()
+            kv_cache_config = self._initialize_kv_caches(self.vllm_config)
+            self._rebuild_scheduler_for_runtime_topology(
+                kv_cache_config,
+                drained_requests,
+            )
+        except BaseException:
+            logger.exception("Runtime topology switch failed")
+            raise
+        else:
+            self.resume_scheduler()
+
+        return {
+            "previous": topology_descriptor_to_dict(plan.previous_topology),
+            "target": topology_descriptor_to_dict(plan.target_topology),
+        }
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:

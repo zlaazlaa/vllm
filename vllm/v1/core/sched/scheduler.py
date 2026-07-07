@@ -2166,6 +2166,54 @@ class Scheduler(SchedulerInterface):
         )
         return num_waiting + len(self.running)
 
+    def _reset_request_for_runtime_topology_recompute(
+        self,
+        request: Request,
+    ) -> None:
+        request.num_computed_tokens = 0
+        request.spec_token_ids = []
+        request.num_output_placeholders = 0
+        request.async_tokens_to_discard = 0
+        request.next_decode_eligible_step = 0
+        request.last_sched_seq = 0
+        request.is_prefill_chunk = False
+        request.kv_transfer_params = None
+
+    def drain_unfinished_requests_for_recompute(
+        self,
+        *,
+        reset_running_requests: bool,
+    ) -> list[Request]:
+        if self.running and not reset_running_requests:
+            raise ValueError(
+                "Cannot drain running requests without recompute reset"
+            )
+        if reset_running_requests:
+            self.reset_prefix_cache(reset_running_requests=True)
+
+        drained: list[Request] = []
+        seen_req_ids: set[str] = set()
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                if request.request_id in seen_req_ids:
+                    continue
+                self._reset_request_for_runtime_topology_recompute(request)
+                drained.append(request)
+                seen_req_ids.add(request.request_id)
+
+        self.requests.clear()
+        self.running = []
+        self.waiting = create_request_queue(self.policy)
+        self.skipped_waiting = create_request_queue(self.policy)
+        self._inflight_prefills.clear()
+        self.reset_preempted_req_ids.clear()
+        self.prev_step_scheduled_req_ids.clear()
+        self.finished_req_ids.clear()
+        self.finished_recving_kv_req_ids.clear()
+        self.failed_recving_kv_req_ids.clear()
+        self.deferred_frees.clear()
+        return drained
+
     def has_finished_requests(self) -> bool:
         if self.finished_req_ids:
             return True

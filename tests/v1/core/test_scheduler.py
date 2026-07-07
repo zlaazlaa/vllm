@@ -27,6 +27,10 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import (
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -41,6 +45,53 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+class _RuntimeTopologyFakeKVManager:
+
+    def __init__(self) -> None:
+        self.freed_requests: list[str] = []
+        self.reset_prefix_cache_called = False
+
+    def free(self, request: Request) -> None:
+        self.freed_requests.append(request.request_id)
+
+    def reset_prefix_cache(self) -> bool:
+        self.reset_prefix_cache_called = True
+        return True
+
+
+class _RuntimeTopologyFakeEncoderCacheManager:
+
+    def __init__(self) -> None:
+        self.freed_requests: list[str] = []
+
+    def free(self, request: Request) -> None:
+        self.freed_requests.append(request.request_id)
+
+
+def make_runtime_topology_scheduler() -> Scheduler:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.running = []
+    scheduler.requests = {}
+    scheduler.kv_cache_manager = _RuntimeTopologyFakeKVManager()
+    scheduler.encoder_cache_manager = _RuntimeTopologyFakeEncoderCacheManager()
+    scheduler._inflight_prefills = set()
+    scheduler.reset_preempted_req_ids = set()
+    scheduler.prev_step_scheduled_req_ids = {"stale"}
+    scheduler.defer_block_free = False
+    scheduler.processed_step_seq = 0
+    scheduler.deferred_frees = []
+    scheduler.connector = None
+    scheduler.log_stats = False
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.finished_req_ids = set()
+    scheduler.finished_recving_kv_req_ids = set()
+    scheduler.failed_recving_kv_req_ids = set()
+    return scheduler
 
 
 def test_add_requests():
@@ -74,6 +125,63 @@ def test_get_num_unfinished_requests():
     for i, request in enumerate(requests):
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
         assert scheduler.get_num_unfinished_requests() == len(requests) - i - 1
+
+
+def test_runtime_topology_drain_resets_running_request_for_recompute():
+    scheduler = make_runtime_topology_scheduler()
+    waiting, running, skipped = create_requests(num_requests=3)
+
+    scheduler.add_request(waiting)
+    scheduler.add_request(running)
+    scheduler.waiting.remove_request(running)
+    running.status = RequestStatus.RUNNING
+    running.num_computed_tokens = 4
+    running.spec_token_ids = [99]
+    running.num_output_placeholders = 1
+    running.async_tokens_to_discard = 3
+    running.next_decode_eligible_step = 8
+    running.last_sched_seq = 5
+    scheduler.running.append(running)
+
+    skipped.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.add_request(skipped)
+    scheduler._inflight_prefills.add(running)
+
+    drained = scheduler.drain_unfinished_requests_for_recompute(
+        reset_running_requests=True
+    )
+
+    assert {request.request_id for request in drained} == {
+        waiting.request_id,
+        running.request_id,
+        skipped.request_id,
+    }
+    assert list(running.output_token_ids) == []
+    assert running.num_computed_tokens == 0
+    assert running.spec_token_ids == []
+    assert running.num_output_placeholders == 0
+    assert running.async_tokens_to_discard == 0
+    assert running.next_decode_eligible_step == 0
+    assert running.last_sched_seq == 0
+    assert scheduler.requests == {}
+    assert scheduler.running == []
+    assert len(scheduler.waiting) == 0
+    assert len(scheduler.skipped_waiting) == 0
+    assert scheduler._inflight_prefills == set()
+
+
+def test_runtime_topology_drain_rejects_running_without_recompute_reset():
+    scheduler = make_runtime_topology_scheduler()
+    (running,) = create_requests(num_requests=1)
+    scheduler.add_request(running)
+    scheduler.waiting.remove_request(running)
+    running.status = RequestStatus.RUNNING
+    scheduler.running.append(running)
+
+    with pytest.raises(ValueError, match="running"):
+        scheduler.drain_unfinished_requests_for_recompute(
+            reset_running_requests=False
+        )
 
 
 @pytest.mark.parametrize(

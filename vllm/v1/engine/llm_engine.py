@@ -428,6 +428,17 @@ class LLMEngine:
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
 
+    def switch_runtime_topology(
+        self,
+        *,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
+    ) -> dict[str, dict[str, int]]:
+        return self.engine_core.switch_runtime_topology(
+            tensor_parallel_size,
+            pipeline_parallel_size,
+        )
+
     def _get_driver_model_for_cleanup(self) -> nn.Module | None:
         driver_worker = getattr(self.model_executor, "driver_worker", None)
         model_runner = getattr(driver_worker, "model_runner", None)
