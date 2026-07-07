@@ -15,6 +15,9 @@ from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.host_weight_store_integration import (
+    prepare_host_weight_store_load_config,
+)
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
@@ -45,6 +48,10 @@ class AsyncOutputFuture(Future):
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
+        self.vllm_config.load_config = prepare_host_weight_store_load_config(
+            self.vllm_config
+        )
+        self.load_config = self.vllm_config.load_config
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
         distributed_init_method, rank, local_rank = self._distributed_args()
         kwargs = dict(

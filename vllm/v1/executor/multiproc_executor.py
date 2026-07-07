@@ -60,7 +60,14 @@ from vllm.utils.system_utils import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
+from vllm.v1.executor.host_weight_store_integration import (
+    prepare_host_weight_store_load_config,
+)
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
+from vllm.v1.executor.worker_lifecycle import (
+    WorkerActivationPlan,
+    WorkerLifecyclePool,
+)
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -123,6 +130,10 @@ class MultiprocExecutor(Executor):
         )
 
         set_multiprocessing_worker_envs()
+        self.vllm_config.load_config = prepare_host_weight_store_load_config(
+            self.vllm_config
+        )
+        self.load_config = self.vllm_config.load_config
 
         # use the loopback address get_loopback_ip() for communication.
         distributed_init_method = get_distributed_init_method(
@@ -199,6 +210,7 @@ class MultiprocExecutor(Executor):
 
             # Wait for all local workers to be ready.
             self.workers = WorkerProc.wait_for_ready(unready_workers)
+            self.worker_lifecycle = WorkerLifecyclePool.from_workers(self.workers)
 
             # Start background thread to monitor worker health if not in headless mode.
             if self.monitor_workers:
@@ -314,6 +326,17 @@ class MultiprocExecutor(Executor):
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
+        )
+
+    def apply_worker_activation_plan(self, plan: WorkerActivationPlan) -> None:
+        worker_lifecycle = getattr(self, "worker_lifecycle", None)
+        if worker_lifecycle is None:
+            worker_lifecycle = WorkerLifecyclePool.from_workers(self.workers)
+            self.worker_lifecycle = worker_lifecycle
+        worker_lifecycle.apply_plan(plan)
+        self.collective_rpc(
+            "apply_worker_activation_plan",
+            args=(worker_lifecycle.active_ranks,),
         )
 
     def sample_tokens(  # type: ignore[override]

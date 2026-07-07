@@ -16,6 +16,7 @@ from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.worker.lifecycle import WorkerRole
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -214,6 +215,7 @@ class WorkerWrapperBase:
         # Initialized after init_worker is called
         self.worker: WorkerBase
         self.vllm_config: VllmConfig
+        self.worker_role = WorkerRole.ACTIVE
 
     def shutdown(self) -> None:
         if self.worker is not None:
@@ -330,6 +332,30 @@ class WorkerWrapperBase:
             # To make vLLM config available during device initialization
             self.worker.init_device()  # type: ignore
 
+    def set_worker_role(self, role: WorkerRole | str) -> None:
+        self.worker_role = WorkerRole(role)
+
+    def apply_worker_activation_plan(
+        self,
+        active_ranks: tuple[int, ...],
+    ) -> WorkerRole:
+        self.worker_role = (
+            WorkerRole.ACTIVE
+            if self.global_rank in active_ranks
+            else WorkerRole.STANDBY
+        )
+        return self.worker_role
+
+    def get_worker_role(self) -> WorkerRole:
+        return self.worker_role
+
+    def _raise_if_standby(self, method: str) -> None:
+        if self.worker_role is WorkerRole.STANDBY:
+            raise RuntimeError(
+                f"Worker rank {self.global_rank} is standby and cannot execute "
+                f"{method}"
+            )
+
     def __getattr__(self, attr: str):
         return getattr(self.worker, attr)
 
@@ -346,9 +372,16 @@ class WorkerWrapperBase:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._raise_if_standby("execute_model")
         self._apply_mm_cache(scheduler_output)
 
         return self.worker.execute_model(scheduler_output)
+
+    def sample_tokens(
+        self, grammar_output: GrammarOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        self._raise_if_standby("sample_tokens")
+        return self.worker.sample_tokens(grammar_output)
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
