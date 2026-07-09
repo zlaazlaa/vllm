@@ -200,6 +200,7 @@ def test_runtime_topology_switch_migrates_live_kv_request(
         result = llm.switch_runtime_topology(
             tensor_parallel_size=target_tp,
             pipeline_parallel_size=target_pp,
+            max_kv_migration_blocks_per_step=2,
         )
 
         middle = _assert_topology(llm, tp=target_tp, pp=target_pp)
@@ -211,6 +212,7 @@ def test_runtime_topology_switch_migrates_live_kv_request(
         assert result["kv_cache_migration"]["policy"] == "migrate"
         assert result["kv_cache_migration"]["reason"] == "capacity_available"
         assert result["kv_cache_migration"]["request_state"] == "migrated"
+        assert result["kv_cache_migration"]["max_blocks_per_step"] == 2
         assert result["kv_cache_migration"]["live_blocks"] > 0
 
         final_output = _drain_request(llm, request_id)
