@@ -13,12 +13,15 @@ from vllm.distributed.topology_cache import (
     parse_topology_descriptors,
 )
 
+RUNTIME_KV_MIGRATION_DATA_PLANES = frozenset(("cpu_staging", "p2p"))
+
 
 @dataclass(frozen=True)
 class RuntimeTopologySwitchRequest:
     tensor_parallel_size: int
     pipeline_parallel_size: int
     max_kv_migration_blocks_per_step: int = 1
+    kv_migration_data_plane: str = "cpu_staging"
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ class RuntimeTopologySwitchPlan:
     previous_topology: TopologyDescriptor
     target_topology: TopologyDescriptor
     max_kv_migration_blocks_per_step: int = 1
+    kv_migration_data_plane: str = "cpu_staging"
 
 
 @dataclass(frozen=True)
@@ -278,6 +282,12 @@ def validate_runtime_topology_switch(
     _reject_unsupported_features(vllm_config)
     if request.max_kv_migration_blocks_per_step < 1:
         raise ValueError("max_kv_migration_blocks_per_step must be >= 1")
+    if request.kv_migration_data_plane not in RUNTIME_KV_MIGRATION_DATA_PLANES:
+        raise ValueError(
+            "kv_migration_data_plane must be one of "
+            f"{sorted(RUNTIME_KV_MIGRATION_DATA_PLANES)}, got "
+            f"{request.kv_migration_data_plane!r}"
+        )
 
     previous = _current_topology(vllm_config)
     try:
@@ -307,4 +317,5 @@ def validate_runtime_topology_switch(
         max_kv_migration_blocks_per_step=(
             request.max_kv_migration_blocks_per_step
         ),
+        kv_migration_data_plane=request.kv_migration_data_plane,
     )

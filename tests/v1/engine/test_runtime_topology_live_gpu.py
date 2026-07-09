@@ -223,6 +223,53 @@ def test_runtime_topology_switch_migrates_live_kv_request(
         gc.collect()
 
 
+def test_runtime_topology_switch_migrates_live_kv_request_p2p(monkeypatch):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
+    prompt = "The capital of France is"
+    llm = _make_llm(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+        use_cuda_graph=False,
+    )
+    try:
+        before = _assert_topology(llm, tp=2, pp=1)
+        baseline = llm.generate([prompt], _sampling_params())[0]
+        baseline_token_ids = _generated_token_ids(baseline)
+
+        request_id = "runtime-topology-live-kv-p2p"
+        llm.llm_engine.add_request(request_id, prompt, _sampling_params())
+        partial_output = _step_until_partial_output(llm, request_id)
+
+        result = llm.switch_runtime_topology(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+            max_kv_migration_blocks_per_step=2,
+            kv_migration_data_plane="p2p",
+        )
+
+        middle = _assert_topology(llm, tp=1, pp=2)
+        assert [item["pid"] for item in middle] == [
+            item["pid"] for item in before
+        ]
+        migration = result["kv_cache_migration"]
+        assert migration["policy"] == "migrate"
+        assert migration["reason"] == "capacity_available"
+        assert migration["request_state"] == "migrated"
+        assert migration["data_plane"] == "p2p"
+        assert migration["p2p_sends"] > 0
+        assert migration["p2p_recvs"] > 0
+
+        final_output = _drain_request(llm, request_id)
+        assert _generated_token_ids(partial_output)
+        assert _generated_token_ids(final_output) == baseline_token_ids
+    finally:
+        del llm
+        gc.collect()
+
+
 @pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["eager", "cudagraph"])
 def test_runtime_topology_switch_runs_consecutive_bidirectional_switches(
     monkeypatch,

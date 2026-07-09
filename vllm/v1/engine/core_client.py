@@ -73,12 +73,16 @@ def _runtime_topology_switch_payload(
     tensor_parallel_size: int,
     pipeline_parallel_size: int,
     max_kv_migration_blocks_per_step: int = 1,
-) -> dict[str, int]:
-    return {
+    kv_migration_data_plane: str = "cpu_staging",
+) -> dict[str, int | str]:
+    payload: dict[str, int | str] = {
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "max_kv_migration_blocks_per_step": max_kv_migration_blocks_per_step,
     }
+    if kv_migration_data_plane != "cpu_staging":
+        payload["kv_migration_data_plane"] = kv_migration_data_plane
+    return payload
 
 
 class EngineCoreClient(ABC):
@@ -219,7 +223,8 @@ class EngineCoreClient(ABC):
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_kv_migration_blocks_per_step: int = 1,
-    ) -> dict[str, dict[str, int]]:
+        kv_migration_data_plane: str = "cpu_staging",
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     def recommend_runtime_topology(self) -> dict[str, Any]:
@@ -301,7 +306,8 @@ class EngineCoreClient(ABC):
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_kv_migration_blocks_per_step: int = 1,
-    ) -> dict[str, dict[str, int]]:
+        kv_migration_data_plane: str = "cpu_staging",
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     async def recommend_runtime_topology_async(self) -> dict[str, Any]:
@@ -402,7 +408,8 @@ class InprocClient(EngineCoreClient):
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_kv_migration_blocks_per_step: int = 1,
-    ) -> dict[str, dict[str, int]]:
+        kv_migration_data_plane: str = "cpu_staging",
+    ) -> dict[str, Any]:
         return self.engine_core.switch_runtime_topology(
             RuntimeTopologySwitchRequest(
                 tensor_parallel_size=tensor_parallel_size,
@@ -410,6 +417,7 @@ class InprocClient(EngineCoreClient):
                 max_kv_migration_blocks_per_step=(
                     max_kv_migration_blocks_per_step
                 ),
+                kv_migration_data_plane=kv_migration_data_plane,
             )
         )
 
@@ -1000,13 +1008,15 @@ class SyncMPClient(MPClient):
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_kv_migration_blocks_per_step: int = 1,
-    ) -> dict[str, dict[str, int]]:
+        kv_migration_data_plane: str = "cpu_staging",
+    ) -> dict[str, Any]:
         return self.call_utility(
             "switch_runtime_topology",
             _runtime_topology_switch_payload(
                 tensor_parallel_size,
                 pipeline_parallel_size,
                 max_kv_migration_blocks_per_step,
+                kv_migration_data_plane,
             ),
         )
 
@@ -1273,13 +1283,15 @@ class AsyncMPClient(MPClient):
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_kv_migration_blocks_per_step: int = 1,
-    ) -> dict[str, dict[str, int]]:
+        kv_migration_data_plane: str = "cpu_staging",
+    ) -> dict[str, Any]:
         return await self.call_utility_async(
             "switch_runtime_topology",
             _runtime_topology_switch_payload(
                 tensor_parallel_size,
                 pipeline_parallel_size,
                 max_kv_migration_blocks_per_step,
+                kv_migration_data_plane,
             ),
         )
 

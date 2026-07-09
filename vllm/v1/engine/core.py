@@ -351,6 +351,7 @@ class EngineCore:
                 "max_blocks_per_step": (
                     switch_plan.max_kv_migration_blocks_per_step
                 ),
+                "data_plane": switch_plan.kv_migration_data_plane,
                 "detail": snapshot_error,
             }
             self._runtime_kv_migration_preparation = {
@@ -369,6 +370,7 @@ class EngineCore:
                 "max_blocks_per_step": (
                     switch_plan.max_kv_migration_blocks_per_step
                 ),
+                "data_plane": switch_plan.kv_migration_data_plane,
             }
             self._runtime_kv_migration_preparation = {
                 "summary": summary,
@@ -401,6 +403,7 @@ class EngineCore:
                 "max_blocks_per_step": (
                     switch_plan.max_kv_migration_blocks_per_step
                 ),
+                "data_plane": switch_plan.kv_migration_data_plane,
                 "detail": str(e),
             }
             self._runtime_kv_migration_preparation = {
@@ -417,6 +420,7 @@ class EngineCore:
             "max_blocks_per_step": (
                 switch_plan.max_kv_migration_blocks_per_step
             ),
+            "data_plane": switch_plan.kv_migration_data_plane,
         }
         self._runtime_kv_migration_preparation = {
             "summary": summary,
@@ -428,7 +432,7 @@ class EngineCore:
 
     def switch_runtime_topology(
         self,
-        request: RuntimeTopologySwitchRequest | dict[str, int],
+        request: RuntimeTopologySwitchRequest | dict[str, Any],
     ) -> dict[str, Any] | Future[dict[str, Any]]:
         if isinstance(request, dict):
             request = RuntimeTopologySwitchRequest(**request)
@@ -547,14 +551,21 @@ class EngineCore:
             if kv_cache_migration["policy"] == RuntimeKVMigrationPolicy.MIGRATE.value:
                 try:
                     migration_prep = self._runtime_kv_migration_preparation
-                    migration_stats = (
-                        self.model_executor.migrate_runtime_kv_cache_for_topology(
-                            plan=migration_prep["plan"],
-                            block_mapping=migration_prep["block_mapping"],
-                            max_blocks_per_step=(
-                                plan.max_kv_migration_blocks_per_step
-                            ),
+                    migration_method = (
+                        self.model_executor
+                        .migrate_runtime_kv_cache_for_topology_p2p
+                        if plan.kv_migration_data_plane == "p2p"
+                        else (
+                            self.model_executor
+                            .migrate_runtime_kv_cache_for_topology
                         )
+                    )
+                    migration_stats = migration_method(
+                        plan=migration_prep["plan"],
+                        block_mapping=migration_prep["block_mapping"],
+                        max_blocks_per_step=(
+                            plan.max_kv_migration_blocks_per_step
+                        ),
                     )
                     kv_cache_migration.update(migration_stats)
                     kv_cache_migration["request_state"] = "migrated"

@@ -222,6 +222,35 @@ def test_validate_rejects_invalid_runtime_kv_migration_batch_size(monkeypatch):
         )
 
 
+def test_validate_accepts_runtime_kv_migration_data_plane(monkeypatch):
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+
+    plan = validate_runtime_topology_switch(
+        make_config(tp=2, pp=1, world_size=2),
+        RuntimeTopologySwitchRequest(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+            kv_migration_data_plane="p2p",
+        ),
+    )
+
+    assert plan.kv_migration_data_plane == "p2p"
+
+
+def test_validate_rejects_invalid_runtime_kv_migration_data_plane(monkeypatch):
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+
+    with pytest.raises(ValueError, match="kv_migration_data_plane"):
+        validate_runtime_topology_switch(
+            make_config(tp=2, pp=1, world_size=2),
+            RuntimeTopologySwitchRequest(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=2,
+                kv_migration_data_plane="unknown",
+            ),
+        )
+
+
 def test_recommend_runtime_topology_prefers_tp_for_low_concurrency(monkeypatch):
     monkeypatch.setenv(
         "VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES",
@@ -360,6 +389,28 @@ class FakeSwitchExecutor:
             "migration_steps": 2,
             "tensor_copies": 6,
             "source_shards": 2,
+        }
+
+    def migrate_runtime_kv_cache_for_topology_p2p(
+        self,
+        *,
+        plan,
+        block_mapping,
+        max_blocks_per_step=1,
+    ):
+        self.events.append(
+            (
+                "migrate_kv_p2p",
+                plan.target_topology,
+                dict(block_mapping),
+                max_blocks_per_step,
+            )
+        )
+        return {
+            "migration_steps": 2,
+            "tensor_copies": 6,
+            "p2p_sends": 1,
+            "p2p_recvs": 1,
         }
 
 
@@ -695,6 +746,57 @@ def test_engine_core_switch_runtime_topology_uses_requested_kv_migration_batch_s
     assert result["kv_cache_migration"]["max_blocks_per_step"] == 3
 
 
+def test_engine_core_switch_runtime_topology_uses_requested_kv_data_plane(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+    events = []
+    config = make_config(tp=2, pp=1, world_size=2)
+    engine = EngineCore.__new__(EngineCore)
+    engine.vllm_config = config
+    engine.scheduler = FakeSwitchScheduler(events)
+    engine.scheduler.collect_runtime_kv_block_ids = lambda: {
+        "req-0": [2, 4, 7],
+    }
+    engine.model_executor = FakeSwitchExecutor(events)
+    engine._initialize_kv_caches = lambda vllm_config: make_kv_config(
+        num_blocks=8
+    )
+
+    def rebuild_scheduler(kv_cache_config, drained_requests):
+        engine.scheduler = FakeSwitchScheduler(events)
+
+    engine._rebuild_scheduler_for_runtime_topology = rebuild_scheduler
+
+    result = engine.switch_runtime_topology(
+        RuntimeTopologySwitchRequest(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+            kv_migration_data_plane="p2p",
+        )
+    )
+
+    target = TopologyDescriptor(
+        world_size=2,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+    )
+    assert (
+        "migrate_kv_p2p",
+        target,
+        {2: 2, 4: 4, 7: 7},
+        1,
+    ) in events
+    assert not any(
+        event[0] == "migrate_kv"
+        for event in events
+        if isinstance(event, tuple)
+    )
+    assert result["kv_cache_migration"]["data_plane"] == "p2p"
+    assert result["kv_cache_migration"]["p2p_sends"] == 1
+    assert result["kv_cache_migration"]["p2p_recvs"] == 1
+
+
 @pytest.mark.parametrize(
     ("load_format", "expected_uses_host_weight_store"),
     [
@@ -895,8 +997,14 @@ def test_engine_core_recommend_runtime_topology_uses_scheduler_load(monkeypatch)
 def test_llm_engine_switch_runtime_topology_delegates_to_core_client():
     calls = []
     engine = LLMEngine.__new__(LLMEngine)
-    def switch_runtime_topology(tp, pp, max_blocks_per_step=1):
-        calls.append((tp, pp, max_blocks_per_step))
+
+    def switch_runtime_topology(
+        tp,
+        pp,
+        max_blocks_per_step=1,
+        kv_migration_data_plane="cpu_staging",
+    ):
+        calls.append((tp, pp, max_blocks_per_step, kv_migration_data_plane))
         return {
             "target": {
                 "tensor_parallel_size": tp,
@@ -914,7 +1022,7 @@ def test_llm_engine_switch_runtime_topology_delegates_to_core_client():
         max_kv_migration_blocks_per_step=4,
     )
 
-    assert calls == [(1, 2, 4)]
+    assert calls == [(1, 2, 4, "cpu_staging")]
     assert result["target"]["pipeline_parallel_size"] == 2
 
 
@@ -1015,6 +1123,24 @@ def test_sync_mp_client_switch_runtime_topology_sends_msgpack_safe_dict():
     assert result["target"]["pipeline_parallel_size"] == 2
 
 
+def test_sync_mp_client_switch_runtime_topology_sends_kv_data_plane():
+    sent = []
+    client = SyncMPClient.__new__(SyncMPClient)
+    client.call_utility = lambda method, payload: sent.append((method, payload)) or {
+        "target": payload
+    }
+
+    result = client.switch_runtime_topology(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+        kv_migration_data_plane="p2p",
+    )
+
+    assert sent[0][0] == "switch_runtime_topology"
+    assert sent[0][1]["kv_migration_data_plane"] == "p2p"
+    assert result["target"]["kv_migration_data_plane"] == "p2p"
+
+
 def test_sync_mp_client_recommend_runtime_topology_sends_utility_call():
     sent = []
     client = SyncMPClient.__new__(SyncMPClient)
@@ -1059,6 +1185,31 @@ def test_async_mp_client_switch_runtime_topology_sends_msgpack_safe_dict():
         )
     ]
     assert result["target"]["pipeline_parallel_size"] == 2
+
+
+def test_async_mp_client_switch_runtime_topology_sends_kv_data_plane():
+    import asyncio
+
+    sent = []
+    client = AsyncMPClient.__new__(AsyncMPClient)
+
+    async def call_utility_async(method, payload):
+        sent.append((method, payload))
+        return {"target": payload}
+
+    client.call_utility_async = call_utility_async
+
+    result = asyncio.run(
+        client.switch_runtime_topology_async(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+            kv_migration_data_plane="p2p",
+        )
+    )
+
+    assert sent[0][0] == "switch_runtime_topology"
+    assert sent[0][1]["kv_migration_data_plane"] == "p2p"
+    assert result["target"]["kv_migration_data_plane"] == "p2p"
 
 
 def test_async_mp_client_recommend_runtime_topology_sends_utility_call():
