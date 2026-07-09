@@ -45,6 +45,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
+    get_world_group,
 )
 from vllm.distributed.topology_cache import TopologyDescriptor
 from vllm.distributed.weight_transfer import (
@@ -72,8 +73,10 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.kv_cache_migration import (
     RuntimeKVMigrationPlan,
+    RuntimeKVP2PTransfer,
     RuntimeKVSourceTensor,
     get_runtime_topology_kv_rank,
+    iter_runtime_kv_p2p_transfers,
     migrate_runtime_kv_cache_shard,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -629,6 +632,376 @@ class Worker(WorkerBase):
         return {
             "migration_steps": stats.migration_steps,
             "tensor_copies": stats.tensor_copies,
+        }
+
+    def _validate_runtime_kv_p2p_block_inputs(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        block_mapping: dict[int, int],
+        source_block_ids: Sequence[int],
+    ) -> tuple[int, ...]:
+        source_block_id_tuple = tuple(source_block_ids)
+        if len(source_block_id_tuple) != plan.live_blocks:
+            raise ValueError(
+                "source_block_ids length must match plan.live_blocks; "
+                f"got {len(source_block_id_tuple)=} and "
+                f"{plan.live_blocks=}"
+            )
+        if len(block_mapping) != len(source_block_id_tuple):
+            raise ValueError(
+                "block_mapping length must match source_block_ids; "
+                f"got {len(block_mapping)=} and "
+                f"{len(source_block_id_tuple)=}"
+            )
+        expected_keys = set(range(len(source_block_id_tuple)))
+        if set(block_mapping) != expected_keys:
+            raise ValueError(
+                "runtime KV P2P block_mapping keys must be packed local "
+                f"block ids {sorted(expected_keys)}"
+            )
+        for source_block_id in source_block_id_tuple:
+            if source_block_id < 0:
+                raise ValueError(
+                    f"source block id must be >= 0, got {source_block_id}"
+                )
+            if source_block_id == 0:
+                raise ValueError("source block id must exclude the null block 0")
+
+        for target_block_id in block_mapping.values():
+            if target_block_id < 0:
+                raise ValueError(
+                    f"target block id must be >= 0, got {target_block_id}"
+                )
+            if target_block_id == 0:
+                raise ValueError("target block id must exclude the null block 0")
+            if target_block_id >= plan.target_num_blocks:
+                raise ValueError(
+                    "target block id must be smaller than target_num_blocks; "
+                    f"got {target_block_id=} and "
+                    f"{plan.target_num_blocks=}"
+                )
+        if len(set(block_mapping.values())) != len(block_mapping):
+            raise ValueError("block_mapping contains duplicate target block ids")
+        return source_block_id_tuple
+
+    def _validate_runtime_kv_p2p_source_transfer(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        transfer: RuntimeKVP2PTransfer,
+    ) -> None:
+        source_kv_caches = getattr(
+            self,
+            "_runtime_topology_source_kv_caches",
+            None,
+        )
+        if source_kv_caches is None:
+            raise ValueError("runtime KV P2P migration requires source snapshots")
+        if not isinstance(source_kv_caches, dict):
+            raise ValueError(
+                "runtime KV P2P migration requires layer-name KV cache snapshots"
+            )
+        try:
+            source_tensor = source_kv_caches[transfer.layer_name]
+        except KeyError as e:
+            raise ValueError(
+                f"missing runtime KV P2P source layer {transfer.layer_name!r}"
+            ) from e
+        if not isinstance(source_tensor, torch.Tensor):
+            raise ValueError(
+                "runtime KV P2P migration source snapshots must contain "
+                f"tensors; layer {transfer.layer_name!r} has "
+                f"{type(source_tensor)!r}"
+            )
+        if any(
+            block_id >= source_tensor.shape[0]
+            for block_id in transfer.block_ids
+        ):
+            raise ValueError(
+                "runtime KV P2P source block id exceeds source shard "
+                f"capacity {source_tensor.shape[0]}"
+            )
+
+        global_num_kv_heads = plan.global_num_kv_heads or max(
+            partition.head_indices.stop for partition in plan.tp_partitions
+        )
+        if global_num_kv_heads % plan.source_topology.tensor_parallel_size != 0:
+            raise ValueError(
+                "runtime KV P2P source head slicing requires KV heads to be "
+                "divisible by source tensor parallel size"
+            )
+        heads_per_source_rank = (
+            global_num_kv_heads // plan.source_topology.tensor_parallel_size
+        )
+        source_head_start = transfer.source_tp_rank * heads_per_source_rank
+        local_head_indices = tuple(
+            head_index - source_head_start
+            for head_index in transfer.head_indices
+        )
+        if any(
+            local_head_index < 0
+            or local_head_index >= source_tensor.shape[3]
+            for local_head_index in local_head_indices
+        ):
+            raise ValueError(
+                "runtime KV P2P source head id exceeds source shard "
+                f"capacity {source_tensor.shape[3]}"
+            )
+
+    def _check_runtime_kv_p2p_preflight(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        block_mapping: dict[int, int],
+        source_block_ids: Sequence[int],
+        transfers: Sequence[RuntimeKVP2PTransfer],
+        target_kv_caches: dict[str, torch.Tensor] | None,
+        target_in_plan: bool,
+        world_group: Any,
+    ) -> None:
+        try:
+            self._validate_runtime_kv_p2p_block_inputs(
+                plan=plan,
+                block_mapping=block_mapping,
+                source_block_ids=source_block_ids,
+            )
+            for transfer in transfers:
+                if self.rank == transfer.source_rank:
+                    self._validate_runtime_kv_p2p_source_transfer(
+                        plan=plan,
+                        transfer=transfer,
+                    )
+            if target_in_plan and target_kv_caches is None:
+                raise ValueError(
+                    "runtime KV migration requires layer-name target KV caches"
+                )
+            local_status: dict[str, object] = {
+                "ok": True,
+                "rank": self.rank,
+            }
+        except Exception as e:
+            local_status = {
+                "ok": False,
+                "rank": self.rank,
+                "error": str(e),
+            }
+
+        local_rank = getattr(world_group, "rank_in_group", self.rank)
+        world_size = getattr(
+            world_group,
+            "world_size",
+            plan.target_topology.world_size,
+        )
+        first_error: dict[str, object] | None = None
+        for src in range(world_size):
+            status = world_group.broadcast_object(
+                local_status if local_rank == src else None,
+                src=src,
+            )
+            if (
+                isinstance(status, dict)
+                and not bool(status.get("ok", False))
+                and first_error is None
+            ):
+                first_error = status
+        if first_error is not None:
+            rank = first_error.get("rank", "unknown")
+            error = first_error.get("error", "unknown error")
+            raise ValueError(
+                f"runtime KV P2P preflight failed on rank {rank}: {error}"
+            )
+
+    def _slice_runtime_kv_source_for_p2p(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        layer_name: str,
+        block_ids: Sequence[int],
+        head_indices: Sequence[int],
+        source_tp_rank: int,
+    ) -> RuntimeKVSourceTensor:
+        source_kv_caches = getattr(
+            self,
+            "_runtime_topology_source_kv_caches",
+            None,
+        )
+        if source_kv_caches is None:
+            raise ValueError("runtime KV P2P migration requires source snapshots")
+        if not isinstance(source_kv_caches, dict):
+            raise ValueError(
+                "runtime KV P2P migration requires layer-name KV cache snapshots"
+            )
+        try:
+            source_tensor = source_kv_caches[layer_name]
+        except KeyError as e:
+            raise ValueError(
+                f"missing runtime KV P2P source layer {layer_name!r}"
+            ) from e
+        if not isinstance(source_tensor, torch.Tensor):
+            raise ValueError(
+                "runtime KV P2P migration source snapshots must contain "
+                f"tensors; layer {layer_name!r} has {type(source_tensor)!r}"
+            )
+        for block_id in block_ids:
+            if block_id < 0:
+                raise ValueError(f"source block id must be >= 0, got {block_id}")
+            if block_id >= source_tensor.shape[0]:
+                raise ValueError(
+                    "runtime KV P2P source block id exceeds source shard "
+                    f"capacity {source_tensor.shape[0]}"
+                )
+
+        tensor = source_tensor.detach()
+        if block_ids:
+            block_index = torch.tensor(
+                tuple(block_ids),
+                dtype=torch.long,
+                device=tensor.device,
+            )
+            tensor = tensor.index_select(0, block_index)
+
+        global_num_kv_heads = plan.global_num_kv_heads or max(
+            partition.head_indices.stop for partition in plan.tp_partitions
+        )
+        if global_num_kv_heads % plan.source_topology.tensor_parallel_size != 0:
+            raise ValueError(
+                "runtime KV P2P source head slicing requires KV heads to be "
+                "divisible by source tensor parallel size"
+            )
+        heads_per_source_rank = (
+            global_num_kv_heads // plan.source_topology.tensor_parallel_size
+        )
+        source_head_start = source_tp_rank * heads_per_source_rank
+        local_head_indices = tuple(
+            head_index - source_head_start for head_index in head_indices
+        )
+        head_index = torch.tensor(
+            local_head_indices,
+            dtype=torch.long,
+            device=tensor.device,
+        )
+        tensor = tensor.index_select(3, head_index)
+        return RuntimeKVSourceTensor(
+            tensor=tensor,
+            head_indices=tuple(head_indices),
+        )
+
+    def migrate_runtime_kv_cache_for_topology_p2p(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        block_mapping: dict[int, int],
+        source_block_ids: Sequence[int],
+        max_blocks_per_step: int,
+    ) -> dict[str, int]:
+        if max_blocks_per_step < 1:
+            raise ValueError("max_blocks_per_step must be >= 1")
+
+        source_block_ids = tuple(source_block_ids)
+        transfers = list(
+            iter_runtime_kv_p2p_transfers(plan, block_ids=source_block_ids)
+        )
+        source_kv_caches: dict[
+            tuple[int, int],
+            dict[str, torch.Tensor | RuntimeKVSourceTensor],
+        ] = {}
+        p2p_sends = 0
+        p2p_recvs = 0
+        world_group = get_world_group()
+        target_kv_caches = getattr(
+            self.model_runner,
+            "_runtime_topology_kv_caches_by_layer",
+            None,
+        )
+        target_pp_rank, target_tp_rank = get_runtime_topology_kv_rank(
+            plan.target_topology,
+            rank=self.rank,
+        )
+        target_in_plan = (
+            any(
+                partition.pp_rank == target_pp_rank
+                for partition in plan.pp_partitions
+            )
+            and any(
+                partition.tp_rank == target_tp_rank
+                for partition in plan.tp_partitions
+            )
+        )
+        self._check_runtime_kv_p2p_preflight(
+            plan=plan,
+            block_mapping=block_mapping,
+            source_block_ids=source_block_ids,
+            transfers=transfers,
+            target_kv_caches=target_kv_caches,
+            target_in_plan=target_in_plan,
+            world_group=world_group,
+        )
+        if not source_block_ids:
+            return {
+                "migration_steps": 0,
+                "tensor_copies": 0,
+                "p2p_sends": 0,
+                "p2p_recvs": 0,
+            }
+
+        for transfer in transfers:
+            if self.rank == transfer.source_rank:
+                source_cache = self._slice_runtime_kv_source_for_p2p(
+                    plan=plan,
+                    layer_name=transfer.layer_name,
+                    block_ids=transfer.block_ids,
+                    head_indices=transfer.head_indices,
+                    source_tp_rank=transfer.source_tp_rank,
+                )
+                if transfer.target_rank == self.rank:
+                    source_kv_caches.setdefault(
+                        (transfer.source_pp_rank, transfer.source_tp_rank),
+                        {},
+                    )[transfer.layer_name] = source_cache
+                else:
+                    world_group.send_tensor_dict(
+                        {
+                            "tensor": source_cache.tensor,
+                            "head_indices": source_cache.head_indices,
+                        },
+                        dst=transfer.target_rank,
+                    )
+                    p2p_sends += 1
+            elif self.rank == transfer.target_rank:
+                payload = world_group.recv_tensor_dict(src=transfer.source_rank)
+                if payload is None:
+                    raise ValueError("runtime KV P2P receive returned no payload")
+                source_kv_caches.setdefault(
+                    (transfer.source_pp_rank, transfer.source_tp_rank),
+                    {},
+                )[transfer.layer_name] = RuntimeKVSourceTensor(
+                    tensor=payload["tensor"],
+                    head_indices=tuple(payload["head_indices"]),
+                )
+                p2p_recvs += 1
+
+        migration_steps = 0
+        tensor_copies = 0
+        if target_in_plan:
+            assert target_kv_caches is not None
+            stats = migrate_runtime_kv_cache_shard(
+                plan=plan,
+                source_kv_caches=source_kv_caches,
+                target_kv_caches=target_kv_caches,
+                target_pp_rank=target_pp_rank,
+                target_tp_rank=target_tp_rank,
+                block_mapping=block_mapping,
+                max_blocks_per_step=max_blocks_per_step,
+            )
+            migration_steps = stats.migration_steps
+            tensor_copies = stats.tensor_copies
+
+        return {
+            "migration_steps": migration_steps,
+            "tensor_copies": tensor_copies,
+            "p2p_sends": p2p_sends,
+            "p2p_recvs": p2p_recvs,
         }
 
     def clear_runtime_kv_state(self) -> None:

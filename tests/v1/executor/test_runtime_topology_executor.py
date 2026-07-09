@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.distributed.topology_cache import TopologyDescriptor
@@ -720,6 +721,247 @@ def test_gpu_worker_executes_runtime_kv_migration_on_target_shard(monkeypatch):
 
     assert result == {"migration_steps": 1, "tensor_copies": 1}
     assert calls[0]["target_kv_caches"] is target
+
+
+class FakeWorldGroup:
+
+    def __init__(
+        self,
+        *,
+        rank=0,
+        world_size=2,
+        received=None,
+        preflight=None,
+        fail_on_send=False,
+        fail_on_recv=False,
+    ):
+        self.rank_in_group = rank
+        self.world_size = world_size
+        self.sent = []
+        self.received = received or {}
+        self.preflight = preflight or {}
+        self.broadcasts = []
+        self.recv_calls = []
+        self.fail_on_send = fail_on_send
+        self.fail_on_recv = fail_on_recv
+
+    def broadcast_object(self, obj=None, src=0):
+        self.broadcasts.append((src, obj))
+        if src == self.rank_in_group:
+            return obj
+        return self.preflight.get(src, {"ok": True, "rank": src})
+
+    def send_tensor_dict(self, tensor_dict, dst):
+        if self.fail_on_send:
+            raise AssertionError("P2P send should not run")
+        self.sent.append((dst, tensor_dict))
+
+    def recv_tensor_dict(self, src):
+        self.recv_calls.append(src)
+        if self.fail_on_recv:
+            raise AssertionError("P2P recv should not run")
+        return self.received[src]
+
+
+def _p2p_migration_plan() -> RuntimeKVMigrationPlan:
+    return RuntimeKVMigrationPlan(
+        source_topology=TopologyDescriptor(
+            world_size=2,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+        ),
+        target_topology=TopologyDescriptor(
+            world_size=2,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+        ),
+        policy=RuntimeKVMigrationPolicy.MIGRATE,
+        reason="capacity_available",
+        pp_partitions=[
+            RuntimeKVLayerPartition(pp_rank=0, layer_indices=range(0, 1)),
+        ],
+        tp_partitions=[
+            RuntimeKVHeadPartition(tp_rank=0, head_indices=range(0, 4)),
+        ],
+        live_blocks=2,
+        target_num_blocks=8,
+        layer_names=(
+            "model.layers.0.self_attn",
+            "model.layers.1.self_attn",
+        ),
+        global_num_kv_heads=4,
+    )
+
+
+def test_gpu_worker_sends_runtime_kv_p2p_source_slice(monkeypatch):
+    worker = Worker.__new__(Worker)
+    worker.rank = 1
+    source_tensor = torch.arange(8 * 2 * 2 * 2 * 1).reshape(8, 2, 2, 2, 1)
+    worker._runtime_topology_source_kv_caches = {
+        "model.layers.0.self_attn": source_tensor,
+    }
+    worker.model_runner = FakeModelRunner(target={})
+    fake_world = FakeWorldGroup(rank=worker.rank)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_worker.get_world_group",
+        lambda: fake_world,
+    )
+    plan = _p2p_migration_plan()
+
+    result = worker.migrate_runtime_kv_cache_for_topology_p2p(
+        plan=plan,
+        block_mapping={0: 1, 1: 2},
+        source_block_ids=(3, 5),
+        max_blocks_per_step=2,
+    )
+
+    assert result == {
+        "migration_steps": 0,
+        "tensor_copies": 0,
+        "p2p_sends": 1,
+        "p2p_recvs": 0,
+    }
+    [(dst, payload)] = fake_world.sent
+    assert dst == 0
+    assert payload["head_indices"] == (2, 3)
+    torch.testing.assert_close(payload["tensor"], source_tensor[(3, 5), ...])
+
+
+def test_gpu_worker_receives_runtime_kv_p2p_and_writes_target(monkeypatch):
+    worker = Worker.__new__(Worker)
+    worker.rank = 0
+    local_source = torch.full((8, 2, 2, 2, 1), 11, dtype=torch.int64)
+    remote_source = torch.full((2, 2, 2, 2, 1), 22, dtype=torch.int64)
+    target_tensor = torch.zeros(8, 2, 2, 4, 1, dtype=torch.int64)
+    worker._runtime_topology_source_kv_caches = {
+        "model.layers.0.self_attn": local_source,
+    }
+    worker.model_runner = FakeModelRunner(
+        target={"model.layers.0.self_attn": target_tensor}
+    )
+    fake_world = FakeWorldGroup(
+        rank=worker.rank,
+        received={
+            1: {
+                "tensor": remote_source,
+                "head_indices": (2, 3),
+            }
+        }
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_worker.get_world_group",
+        lambda: fake_world,
+    )
+    plan = _p2p_migration_plan()
+
+    result = worker.migrate_runtime_kv_cache_for_topology_p2p(
+        plan=plan,
+        block_mapping={0: 1, 1: 2},
+        source_block_ids=(3, 5),
+        max_blocks_per_step=2,
+    )
+
+    assert result["p2p_sends"] == 0
+    assert result["p2p_recvs"] == 1
+    assert result["migration_steps"] == 1
+    assert result["tensor_copies"] == 8
+    local_target = target_tensor[1:3, :, :, :2, :]
+    remote_target = target_tensor[1:3, :, :, 2:, :]
+    torch.testing.assert_close(local_target, torch.full_like(local_target, 11))
+    torch.testing.assert_close(remote_target, torch.full_like(remote_target, 22))
+
+
+def test_gpu_worker_p2p_raises_remote_preflight_error_before_recv(monkeypatch):
+    worker = Worker.__new__(Worker)
+    worker.rank = 0
+    local_source = torch.full((8, 2, 2, 2, 1), 11, dtype=torch.int64)
+    target_tensor = torch.zeros(8, 2, 2, 4, 1, dtype=torch.int64)
+    worker._runtime_topology_source_kv_caches = {
+        "model.layers.0.self_attn": local_source,
+    }
+    worker.model_runner = FakeModelRunner(
+        target={"model.layers.0.self_attn": target_tensor}
+    )
+    fake_world = FakeWorldGroup(
+        rank=worker.rank,
+        preflight={
+            1: {
+                "ok": False,
+                "rank": 1,
+                "error": "missing runtime KV P2P source layer",
+            }
+        },
+        fail_on_recv=True,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_worker.get_world_group",
+        lambda: fake_world,
+    )
+    plan = _p2p_migration_plan()
+
+    with pytest.raises(ValueError, match="preflight failed on rank 1"):
+        worker.migrate_runtime_kv_cache_for_topology_p2p(
+            plan=plan,
+            block_mapping={0: 1, 1: 2},
+            source_block_ids=(3, 5),
+            max_blocks_per_step=2,
+        )
+
+    assert fake_world.recv_calls == []
+
+
+def test_gpu_worker_p2p_rejects_unpacked_block_mapping_before_send(
+    monkeypatch,
+):
+    worker = Worker.__new__(Worker)
+    worker.rank = 1
+    source_tensor = torch.arange(8 * 2 * 2 * 2 * 1).reshape(8, 2, 2, 2, 1)
+    worker._runtime_topology_source_kv_caches = {
+        "model.layers.0.self_attn": source_tensor,
+    }
+    worker.model_runner = FakeModelRunner(target={})
+    fake_world = FakeWorldGroup(rank=worker.rank, fail_on_send=True)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_worker.get_world_group",
+        lambda: fake_world,
+    )
+    plan = _p2p_migration_plan()
+
+    with pytest.raises(ValueError, match="packed local block ids"):
+        worker.migrate_runtime_kv_cache_for_topology_p2p(
+            plan=plan,
+            block_mapping={3: 1, 5: 2},
+            source_block_ids=(3, 5),
+            max_blocks_per_step=2,
+        )
+
+    assert fake_world.sent == []
+
+
+def test_gpu_worker_p2p_rejects_null_source_block_before_send(monkeypatch):
+    worker = Worker.__new__(Worker)
+    worker.rank = 1
+    source_tensor = torch.arange(8 * 2 * 2 * 2 * 1).reshape(8, 2, 2, 2, 1)
+    worker._runtime_topology_source_kv_caches = {
+        "model.layers.0.self_attn": source_tensor,
+    }
+    worker.model_runner = FakeModelRunner(target={})
+    fake_world = FakeWorldGroup(rank=worker.rank, fail_on_send=True)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_worker.get_world_group",
+        lambda: fake_world,
+    )
+    plan = _p2p_migration_plan()
+
+    with pytest.raises(ValueError, match="exclude the null block 0"):
+        worker.migrate_runtime_kv_cache_for_topology_p2p(
+            plan=plan,
+            block_mapping={0: 1, 1: 2},
+            source_block_ids=(0, 5),
+            max_blocks_per_step=2,
+        )
+
+    assert fake_world.sent == []
 
 
 def test_gpu_worker_skips_runtime_kv_migration_when_batch_plan_excludes_pp(
