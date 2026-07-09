@@ -680,6 +680,50 @@ def test_engine_core_switch_runtime_topology_reports_model_materialization_sourc
     }
 
 
+def test_engine_core_switch_runtime_topology_reports_step_timing(monkeypatch):
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+    events = []
+    config = make_config(tp=2, pp=1, world_size=2)
+    engine = EngineCore.__new__(EngineCore)
+    engine.vllm_config = config
+    engine.scheduler = FakeSwitchScheduler(events)
+    engine.model_executor = FakeSwitchExecutor(events)
+    engine._initialize_kv_caches = lambda vllm_config: make_kv_config()
+
+    def rebuild_scheduler(kv_cache_config, drained_requests):
+        engine.scheduler = FakeSwitchScheduler(events)
+
+    engine._rebuild_scheduler_for_runtime_topology = rebuild_scheduler
+
+    result = engine.switch_runtime_topology(
+        RuntimeTopologySwitchRequest(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+        )
+    )
+
+    timing = result["runtime_switch_timing"]
+    assert set(timing) == {
+        "total_seconds",
+        "communication_activate_seconds",
+        "model_rebuild_seconds",
+        "kv_cache_initialize_seconds",
+        "kv_cache_migration_seconds",
+        "scheduler_rebuild_seconds",
+    }
+    assert all(value >= 0.0 for value in timing.values())
+    measured_steps = [
+        "communication_activate_seconds",
+        "model_rebuild_seconds",
+        "kv_cache_initialize_seconds",
+        "kv_cache_migration_seconds",
+        "scheduler_rebuild_seconds",
+    ]
+    assert timing["total_seconds"] + 1e-6 >= sum(
+        timing[key] for key in measured_steps
+    )
+
+
 def test_engine_core_switch_runtime_topology_clears_kv_snapshot_on_recompute(
     monkeypatch,
 ):

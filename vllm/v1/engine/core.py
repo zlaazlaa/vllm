@@ -458,10 +458,24 @@ class EngineCore:
         self,
         plan: RuntimeTopologySwitchPlan,
     ) -> dict[str, Any]:
+        timing = {
+            "total_seconds": 0.0,
+            "communication_activate_seconds": 0.0,
+            "model_rebuild_seconds": 0.0,
+            "kv_cache_initialize_seconds": 0.0,
+            "kv_cache_migration_seconds": 0.0,
+            "scheduler_rebuild_seconds": 0.0,
+        }
+        total_start = time.perf_counter()
+
+        def add_timing(key: str, start: float) -> None:
+            timing[key] += time.perf_counter() - start
+
         try:
             runtime_kv_block_ids: dict[str, list[int]] = {}
             runtime_kv_snapshot_error: str | None = None
             runtime_kv_snapshot_saved = False
+            kv_migration_start = time.perf_counter()
             try:
                 runtime_kv_block_ids = (
                     self.scheduler.collect_runtime_kv_block_ids()
@@ -472,10 +486,12 @@ class EngineCore:
                 if self._count_live_runtime_kv_blocks(runtime_kv_block_ids) > 0:
                     self.model_executor.snapshot_runtime_kv_caches_for_topology_migration()
                     runtime_kv_snapshot_saved = True
+            add_timing("kv_cache_migration_seconds", kv_migration_start)
 
             batch_queue = getattr(self, "batch_queue", None)
             if batch_queue is not None:
                 batch_queue.clear()
+            communication_start = time.perf_counter()
             apply_runtime_topology_to_config(
                 self.vllm_config,
                 plan.target_topology,
@@ -486,8 +502,20 @@ class EngineCore:
             self.model_executor.activate_model_parallel_topology(
                 plan.target_topology
             )
+            add_timing("communication_activate_seconds", communication_start)
+
+            model_rebuild_start = time.perf_counter()
             self.model_executor.rebuild_model_for_runtime_topology()
+            add_timing("model_rebuild_seconds", model_rebuild_start)
+
+            kv_cache_initialize_start = time.perf_counter()
             kv_cache_config = self._initialize_kv_caches(self.vllm_config)
+            add_timing(
+                "kv_cache_initialize_seconds",
+                kv_cache_initialize_start,
+            )
+
+            kv_migration_start = time.perf_counter()
             migration_kv_cache_config = getattr(
                 self,
                 "_runtime_global_kv_cache_config",
@@ -540,7 +568,9 @@ class EngineCore:
                         self.model_executor.clear_runtime_kv_migration_snapshot()
             elif runtime_kv_snapshot_saved:
                 self.model_executor.clear_runtime_kv_migration_snapshot()
+            add_timing("kv_cache_migration_seconds", kv_migration_start)
 
+            scheduler_rebuild_start = time.perf_counter()
             if runtime_kv_restore is not None:
                 drained_requests = (
                     self.scheduler
@@ -587,11 +617,13 @@ class EngineCore:
                         kv_cache_config,
                         drained_requests,
                     )
+            add_timing("scheduler_rebuild_seconds", scheduler_rebuild_start)
         except BaseException:
             logger.exception("Runtime topology switch failed")
             raise
         else:
             self.resume_scheduler()
+            timing["total_seconds"] = time.perf_counter() - total_start
 
         return {
             "previous": topology_descriptor_to_dict(plan.previous_topology),
@@ -599,6 +631,7 @@ class EngineCore:
             "model_materialization": (
                 self._runtime_model_materialization_summary()
             ),
+            "runtime_switch_timing": timing,
             "kv_cache_migration": kv_cache_migration,
         }
 
