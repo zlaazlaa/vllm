@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.gpu import eplb_utils as eplb
+from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 from vllm.v1.worker.gpu import model_runner as mrv2
 
 
@@ -202,3 +203,165 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     output = mrv2.GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
+
+
+class FakeCudaGraphManager:
+
+    def __init__(self) -> None:
+        self.cleared = False
+
+    def clear(self) -> None:
+        self.cleared = True
+
+
+class FakeBreakableGraphRunner:
+
+    def __init__(self) -> None:
+        self.cleared = False
+
+    def clear_graphs(self) -> None:
+        self.cleared = True
+
+
+def test_v2_cudagraph_manager_clear_releases_captured_state():
+    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
+    breakable_runner = FakeBreakableGraphRunner()
+    manager.graphs = {"desc": object()}
+    manager._graphs_captured = True
+    manager.breakable_cg_runner = breakable_runner
+    manager.pool = object()
+    manager.hidden_states = object()
+    manager.aux_hidden_states = [object()]
+    manager.intermediate_tensors = object()
+
+    manager.clear()
+
+    assert manager.graphs == {}
+    assert manager._graphs_captured is False
+    assert breakable_runner.cleared
+    assert manager.breakable_cg_runner is None
+    assert manager.pool is None
+    assert manager.hidden_states is None
+    assert manager.aux_hidden_states == []
+    assert manager.intermediate_tensors is None
+
+
+def test_v2_topology_rebuild_clears_cudagraph_manager(monkeypatch):
+    runner = _make_runner()
+    runner.kv_caches = [object()]
+    runner.attn_groups = [[object()]]
+    runner.kv_cache_config = object()
+    runner.model_state = object()
+    runner.model = object()
+    manager = FakeCudaGraphManager()
+    runner.cudagraph_manager = manager
+    calls = []
+    graph_pool_reset_calls = []
+
+    monkeypatch.setattr(mrv2.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(mrv2, "free_before_shutdown", lambda config: calls.append(config))
+    monkeypatch.setattr(
+        mrv2.current_platform,
+        "reset_global_graph_pool",
+        lambda: graph_pool_reset_calls.append("pool"),
+    )
+
+    mrv2.GPUModelRunner.clear_runtime_state_for_topology_rebuild(
+        runner,
+        clear_model=True,
+    )
+
+    assert manager.cleared
+    assert runner.cudagraph_manager is None
+    assert graph_pool_reset_calls == ["pool"]
+    assert runner.kv_caches == []
+    assert runner.attn_groups == []
+    assert not hasattr(runner, "kv_cache_config")
+    assert not hasattr(runner, "model_state")
+    assert not hasattr(runner, "model")
+    assert calls == [runner.vllm_config]
+
+
+def test_v2_topology_rebuild_without_model_clear_keeps_cudagraph_manager(
+    monkeypatch,
+):
+    runner = _make_runner()
+    runner.kv_caches = [object()]
+    runner.attn_groups = [[object()]]
+    runner.kv_cache_config = object()
+    manager = FakeCudaGraphManager()
+    runner.cudagraph_manager = manager
+    calls = []
+    graph_pool_reset_calls = []
+
+    monkeypatch.setattr(mrv2.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(mrv2, "free_before_shutdown", lambda config: calls.append(config))
+    monkeypatch.setattr(
+        mrv2.current_platform,
+        "reset_global_graph_pool",
+        lambda: graph_pool_reset_calls.append("pool"),
+    )
+
+    mrv2.GPUModelRunner.clear_runtime_state_for_topology_rebuild(
+        runner,
+        clear_model=False,
+    )
+
+    assert not manager.cleared
+    assert runner.cudagraph_manager is manager
+    assert graph_pool_reset_calls == []
+    assert runner.kv_caches == []
+    assert runner.attn_groups == []
+    assert not hasattr(runner, "kv_cache_config")
+    assert calls == []
+
+
+def test_v2_runtime_kv_snapshot_survives_topology_rebuild(monkeypatch):
+    runner = _make_runner()
+    kv_tensor = object()
+    runner.kv_caches = [kv_tensor]
+    runner.attn_groups = [[object()]]
+    runner.kv_cache_config = object()
+    runner.model_state = object()
+    runner.model = object()
+    manager = FakeCudaGraphManager()
+    runner.cudagraph_manager = manager
+    calls = []
+
+    monkeypatch.setattr(mrv2.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(mrv2, "free_before_shutdown", lambda config: calls.append(config))
+    monkeypatch.setattr(
+        mrv2.current_platform,
+        "reset_global_graph_pool",
+        lambda: None,
+    )
+
+    snapshot = mrv2.GPUModelRunner.snapshot_runtime_kv_caches_for_topology_migration(
+        runner
+    )
+    mrv2.GPUModelRunner.clear_runtime_state_for_topology_rebuild(
+        runner,
+        clear_model=True,
+    )
+
+    assert snapshot == [kv_tensor]
+    assert runner._runtime_topology_source_kv_caches == [kv_tensor]
+    mrv2.GPUModelRunner.clear_runtime_kv_migration_snapshot(runner)
+    assert runner._runtime_topology_source_kv_caches is None
+
+
+def test_v2_runtime_kv_snapshot_uses_layer_named_kv_cache_map():
+    runner = _make_runner()
+    layer_tensor = object()
+    list_tensor = object()
+    runner._runtime_topology_kv_caches_by_layer = {
+        "model.layers.0.self_attn": layer_tensor
+    }
+    runner.kv_caches = [list_tensor]
+
+    snapshot = mrv2.GPUModelRunner.snapshot_runtime_kv_caches_for_topology_migration(
+        runner
+    )
+
+    assert snapshot == {"model.layers.0.self_attn": layer_tensor}
+    assert runner._runtime_topology_source_kv_caches == snapshot

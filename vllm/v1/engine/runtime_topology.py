@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import vllm.envs as envs
-from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.topology_cache import (
     TopologyDescriptor,
     parse_topology_descriptors,
@@ -27,6 +26,30 @@ class RuntimeTopologySwitchPlan:
     target_topology: TopologyDescriptor
 
 
+@dataclass(frozen=True)
+class RuntimeTopologyWorkload:
+    num_running_requests: int
+    num_waiting_requests: int
+
+    def __post_init__(self) -> None:
+        if self.num_running_requests < 0:
+            raise ValueError("num_running_requests must be >= 0")
+        if self.num_waiting_requests < 0:
+            raise ValueError("num_waiting_requests must be >= 0")
+
+    @property
+    def total_requests(self) -> int:
+        return self.num_running_requests + self.num_waiting_requests
+
+
+@dataclass(frozen=True)
+class RuntimeTopologyRecommendation:
+    previous_topology: TopologyDescriptor
+    target_topology: TopologyDescriptor
+    workload: RuntimeTopologyWorkload
+    reason: str
+
+
 def topology_descriptor_to_dict(
     descriptor: TopologyDescriptor,
 ) -> dict[str, int]:
@@ -37,6 +60,26 @@ def topology_descriptor_to_dict(
         "prefill_context_parallel_size": descriptor.prefill_context_parallel_size,
         "decode_context_parallel_size": descriptor.decode_context_parallel_size,
         "data_parallel_size": descriptor.data_parallel_size,
+    }
+
+
+def topology_recommendation_to_dict(
+    recommendation: RuntimeTopologyRecommendation,
+) -> dict[str, Any]:
+    return {
+        "previous": topology_descriptor_to_dict(
+            recommendation.previous_topology
+        ),
+        "target": topology_descriptor_to_dict(recommendation.target_topology),
+        "workload": {
+            "num_running_requests": (
+                recommendation.workload.num_running_requests
+            ),
+            "num_waiting_requests": (
+                recommendation.workload.num_waiting_requests
+            ),
+        },
+        "reason": recommendation.reason,
     }
 
 
@@ -97,14 +140,14 @@ def _target_topology(
     )
 
 
-def collect_runtime_topology_keys(
+def collect_runtime_topology_candidates(
     vllm_config: Any,
-) -> set[tuple[int, int, int, int, int, int]]:
+) -> list[TopologyDescriptor]:
     current = _current_topology(vllm_config)
-    prebuilt = {current.key}
+    prebuilt = {current.key: current}
     topology_spec = envs.VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES
     if not topology_spec:
-        return prebuilt
+        return list(prebuilt.values())
 
     parallel_config = vllm_config.parallel_config
     for descriptor in parse_topology_descriptors(
@@ -118,8 +161,20 @@ def collect_runtime_topology_keys(
             parallel_config.decode_context_parallel_size or 1
         ),
     ):
-        prebuilt.add(descriptor.key)
-    return prebuilt
+        prebuilt[descriptor.key] = descriptor
+    return sorted(
+        prebuilt.values(),
+        key=lambda descriptor: descriptor.key,
+    )
+
+
+def collect_runtime_topology_keys(
+    vllm_config: Any,
+) -> set[tuple[int, int, int, int, int, int]]:
+    return {
+        descriptor.key
+        for descriptor in collect_runtime_topology_candidates(vllm_config)
+    }
 
 
 def _reject_unsupported_features(vllm_config: Any) -> None:
@@ -163,13 +218,54 @@ def _reject_unsupported_features(vllm_config: Any) -> None:
         raise ValueError("runtime topology switching does not support weight offload")
     if _getattr_nested(vllm_config, "offload_config.prefetch.offload_group_size", 0) > 0:
         raise ValueError("runtime topology switching does not support weight offload")
-    cudagraph_mode = _getattr_nested(
-        vllm_config,
-        "compilation_config.cudagraph_mode",
-        CUDAGraphMode.NONE,
+
+
+def recommend_runtime_topology(
+    vllm_config: Any,
+    workload: RuntimeTopologyWorkload,
+) -> RuntimeTopologyRecommendation:
+    _reject_unsupported_features(vllm_config)
+
+    previous = _current_topology(vllm_config)
+    candidates = collect_runtime_topology_candidates(vllm_config)
+
+    if workload.total_requests <= 1:
+        reason = "low_concurrency"
+        target = max(
+            candidates,
+            key=lambda descriptor: (
+                descriptor.tensor_parallel_size,
+                -descriptor.pipeline_parallel_size,
+            ),
+        )
+    elif workload.total_requests >= previous.world_size:
+        reason = "high_concurrency"
+        target = max(
+            candidates,
+            key=lambda descriptor: (
+                descriptor.pipeline_parallel_size,
+                -descriptor.tensor_parallel_size,
+            ),
+        )
+    else:
+        reason = "balanced_concurrency"
+        target = min(
+            candidates,
+            key=lambda descriptor: (
+                abs(
+                    descriptor.tensor_parallel_size
+                    - descriptor.pipeline_parallel_size
+                ),
+                -descriptor.tensor_parallel_size,
+            ),
+        )
+
+    return RuntimeTopologyRecommendation(
+        previous_topology=previous,
+        target_topology=target,
+        workload=workload,
+        reason=reason,
     )
-    if cudagraph_mode != CUDAGraphMode.NONE:
-        raise ValueError("runtime topology switching requires CUDA graph mode NONE")
 
 
 def validate_runtime_topology_switch(

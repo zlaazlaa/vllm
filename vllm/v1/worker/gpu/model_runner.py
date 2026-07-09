@@ -43,6 +43,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -142,6 +143,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
+        self._runtime_topology_kv_caches_by_layer: dict[str, torch.Tensor] = {}
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -487,6 +489,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
+        self._runtime_topology_kv_caches_by_layer = dict(kv_caches_dict)
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -1560,6 +1563,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not clear_model:
             return
 
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.clear()
+            self.cudagraph_manager = None
+        current_platform.reset_global_graph_pool()
         free_before_shutdown(self.vllm_config)
         if hasattr(self, "model_state"):
             del self.model_state
@@ -1567,6 +1574,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator = None
         if hasattr(self, "model"):
             del self.model
+
+    def snapshot_runtime_kv_caches_for_topology_migration(self):
+        kv_caches = getattr(self, "_runtime_topology_kv_caches_by_layer", None)
+        if kv_caches is None:
+            kv_caches = getattr(self, "kv_caches", None)
+        if kv_caches is None:
+            snapshot = None
+        elif isinstance(kv_caches, dict):
+            snapshot = dict(kv_caches)
+        else:
+            snapshot = list(kv_caches)
+        self._runtime_topology_source_kv_caches = snapshot
+        return snapshot
+
+    def clear_runtime_kv_migration_snapshot(self) -> None:
+        self._runtime_topology_source_kv_caches = None
 
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
@@ -1578,6 +1601,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             del self.kv_cache_config
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.clear()
+            self.cudagraph_manager = None
         free_before_shutdown(self.vllm_config)
         if hasattr(self, "model_state"):
             del self.model_state

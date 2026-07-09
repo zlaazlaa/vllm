@@ -219,6 +219,9 @@ class EngineCoreClient(ABC):
     ) -> dict[str, dict[str, int]]:
         raise NotImplementedError
 
+    def recommend_runtime_topology(self) -> dict[str, Any]:
+        raise NotImplementedError
+
     def dp_engines_running(self) -> bool:
         """Returns True if data parallel engines are collectively in a
         running state."""
@@ -295,6 +298,9 @@ class EngineCoreClient(ABC):
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
     ) -> dict[str, dict[str, int]]:
+        raise NotImplementedError
+
+    async def recommend_runtime_topology_async(self) -> dict[str, Any]:
         raise NotImplementedError
 
 
@@ -398,6 +404,9 @@ class InprocClient(EngineCoreClient):
                 pipeline_parallel_size=pipeline_parallel_size,
             )
         )
+
+    def recommend_runtime_topology(self) -> dict[str, Any]:
+        return self.engine_core.recommend_runtime_topology()
 
     def dp_engines_running(self) -> bool:
         return False
@@ -991,6 +1000,9 @@ class SyncMPClient(MPClient):
             ),
         )
 
+    def recommend_runtime_topology(self) -> dict[str, Any]:
+        return self.call_utility("recommend_runtime_topology")
+
     def save_sharded_state(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
@@ -1258,6 +1270,9 @@ class AsyncMPClient(MPClient):
                 pipeline_parallel_size,
             ),
         )
+
+    async def recommend_runtime_topology_async(self) -> dict[str, Any]:
+        return await self.call_utility_async("recommend_runtime_topology")
 
 
 class DPAsyncMPClient(AsyncMPClient):

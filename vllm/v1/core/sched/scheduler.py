@@ -2007,6 +2007,84 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
+    def collect_runtime_kv_block_ids(self) -> dict[str, list[int]]:
+        """Collect allocated KV block ids for runtime topology migration.
+
+        This is intentionally a read-only snapshot. Requests without allocated
+        KV blocks are skipped. The first online migration path supports one KV
+        cache group only; hybrid/multi-group layouts must be handled explicitly
+        before using this snapshot for tensor migration.
+        """
+        block_ids_by_request: dict[str, list[int]] = {}
+        seen_req_ids: set[str] = set()
+        for request in itertools.chain(
+            self.running,
+            self.waiting,
+            self.skipped_waiting,
+            self.requests.values(),
+        ):
+            request_id = request.request_id
+            if request_id in seen_req_ids:
+                continue
+            seen_req_ids.add(request_id)
+            try:
+                block_ids_by_group = self.kv_cache_manager.get_block_ids(request_id)
+            except KeyError:
+                continue
+            if not block_ids_by_group:
+                continue
+            if len(block_ids_by_group) != 1:
+                raise ValueError(
+                    "runtime KV migration currently supports a single KV "
+                    f"cache group; request {request_id!r} has "
+                    f"{len(block_ids_by_group)} groups"
+                )
+            block_ids = block_ids_by_group[0]
+            if block_ids:
+                block_ids_by_request[request_id] = list(block_ids)
+        return block_ids_by_request
+
+    def restore_runtime_kv_blocks_for_migration(
+        self,
+        request_block_ids: dict[str, list[int]],
+        block_mapping: dict[int, int],
+    ) -> None:
+        mapped_block_ids: dict[str, list[int]] = {}
+        for request_id, block_ids in request_block_ids.items():
+            if request_id not in self.requests:
+                raise ValueError(
+                    "runtime KV migration restore got block ids for unknown "
+                    f"request {request_id!r}"
+                )
+            mapped_request_block_ids: list[int] = []
+            for block_id in block_ids:
+                if block_id == 0:
+                    mapped_request_block_ids.append(0)
+                    continue
+                try:
+                    mapped_request_block_ids.append(block_mapping[block_id])
+                except KeyError as e:
+                    raise ValueError(
+                        "runtime KV migration restore is missing a target "
+                        f"block for source block {e.args[0]}"
+                    ) from e
+            mapped_block_ids[request_id] = mapped_request_block_ids
+
+        missing_req_ids = sorted(
+            request_id
+            for request_id, request in self.requests.items()
+            if request.num_computed_tokens > 0
+            and request_id not in mapped_block_ids
+        )
+        if missing_req_ids:
+            raise ValueError(
+                "runtime KV migration restore is missing block ids for "
+                f"computed requests: {missing_req_ids}"
+            )
+
+        if mapped_block_ids:
+            self.kv_cache_manager.restore_runtime_kv_blocks(mapped_block_ids)
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -2023,9 +2101,11 @@ class Scheduler(SchedulerInterface):
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
             if request.resumable:
-                request.streaming_queue = deque()
+                request.streaming_queue = request.streaming_queue or deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                self.num_waiting_for_streaming_input += 1
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -2179,6 +2259,60 @@ class Scheduler(SchedulerInterface):
         request.is_prefill_chunk = False
         request.kv_transfer_params = None
 
+    def _reset_request_for_runtime_topology_kv_migration(
+        self,
+        request: Request,
+    ) -> None:
+        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            request.status = RequestStatus.WAITING
+        if request.num_output_placeholders > 0:
+            request.num_computed_tokens = max(
+                0,
+                request.num_computed_tokens - request.num_output_placeholders,
+            )
+        request.spec_token_ids = []
+        request.num_output_placeholders = 0
+        request.async_tokens_to_discard = 0
+        request.next_decode_eligible_step = 0
+        request.last_sched_seq = 0
+        request.is_prefill_chunk = False
+        request.kv_transfer_params = None
+
+    def drain_unfinished_requests_for_runtime_kv_migration(
+        self,
+    ) -> list[Request]:
+        drained: list[Request] = []
+        seen_req_ids: set[str] = set()
+        for requests in (
+            self.running,
+            self.waiting,
+            self.skipped_waiting,
+            self.requests.values(),
+        ):
+            for request in requests:
+                request_id = request.request_id
+                if request_id in seen_req_ids:
+                    continue
+                if request.is_finished():
+                    continue
+                self._reset_request_for_runtime_topology_kv_migration(request)
+                drained.append(request)
+                seen_req_ids.add(request_id)
+
+        self.requests.clear()
+        self.running = []
+        self.waiting = create_request_queue(self.policy)
+        self.skipped_waiting = create_request_queue(self.policy)
+        self._inflight_prefills.clear()
+        self.reset_preempted_req_ids.clear()
+        self.prev_step_scheduled_req_ids.clear()
+        self.finished_req_ids.clear()
+        self.finished_recving_kv_req_ids.clear()
+        self.failed_recving_kv_req_ids.clear()
+        self.deferred_frees.clear()
+        self.num_waiting_for_streaming_input = 0
+        return drained
+
     def drain_unfinished_requests_for_recompute(
         self,
         *,
@@ -2193,9 +2327,11 @@ class Scheduler(SchedulerInterface):
 
         drained: list[Request] = []
         seen_req_ids: set[str] = set()
-        for queue in (self.waiting, self.skipped_waiting):
+        for queue in (self.waiting, self.skipped_waiting, self.requests.values()):
             for request in queue:
                 if request.request_id in seen_req_ids:
+                    continue
+                if request.is_finished():
                     continue
                 self._reset_request_for_runtime_topology_recompute(request)
                 drained.append(request)
@@ -2212,6 +2348,7 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids.clear()
         self.failed_recving_kv_req_ids.clear()
         self.deferred_frees.clear()
+        self.num_waiting_for_streaming_input = 0
         return drained
 
     def has_finished_requests(self) -> bool:

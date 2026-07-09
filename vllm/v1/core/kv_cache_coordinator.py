@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
 from vllm import envs
@@ -359,6 +359,19 @@ class KVCacheCoordinator(ABC):
             manager.req_to_blocks.get(request_id) or []
             for manager in self.single_type_managers
         )
+
+    def restore_runtime_kv_blocks(
+        self,
+        request_block_ids: Mapping[str, Sequence[int]],
+    ) -> None:
+        if len(self.single_type_managers) != 1:
+            raise ValueError(
+                "runtime KV migration restore currently supports a single "
+                f"KV cache group, got {len(self.single_type_managers)}"
+            )
+        manager = self.single_type_managers[0]
+        for request_id, block_ids in request_block_ids.items():
+            manager.restore_runtime_kv_blocks(request_id, block_ids)
 
     @abstractmethod
     def find_longest_cache_hit(

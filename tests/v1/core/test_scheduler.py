@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from collections import deque
 from unittest.mock import Mock
 
 import pytest
@@ -24,6 +25,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -52,6 +54,8 @@ class _RuntimeTopologyFakeKVManager:
     def __init__(self) -> None:
         self.freed_requests: list[str] = []
         self.reset_prefix_cache_called = False
+        self.block_ids: dict[str, tuple[list[int], ...]] = {}
+        self.restored_block_ids: dict[str, list[int]] = {}
 
     def free(self, request: Request) -> None:
         self.freed_requests.append(request.request_id)
@@ -59,6 +63,15 @@ class _RuntimeTopologyFakeKVManager:
     def reset_prefix_cache(self) -> bool:
         self.reset_prefix_cache_called = True
         return True
+
+    def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
+        return self.block_ids[request_id]
+
+    def restore_runtime_kv_blocks(
+        self,
+        request_block_ids: dict[str, list[int]],
+    ) -> None:
+        self.restored_block_ids.update(request_block_ids)
 
 
 class _RuntimeTopologyFakeEncoderCacheManager:
@@ -91,6 +104,34 @@ def make_runtime_topology_scheduler() -> Scheduler:
     scheduler.finished_req_ids = set()
     scheduler.finished_recving_kv_req_ids = set()
     scheduler.failed_recving_kv_req_ids = set()
+    return scheduler
+
+
+def make_runtime_topology_scheduler_with_real_kv_manager() -> Scheduler:
+    scheduler = make_runtime_topology_scheduler()
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+    scheduler.kv_cache_manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        enable_caching=False,
+    )
     return scheduler
 
 
@@ -182,6 +223,208 @@ def test_runtime_topology_drain_rejects_running_without_recompute_reset():
         scheduler.drain_unfinished_requests_for_recompute(
             reset_running_requests=False
         )
+
+
+def test_runtime_topology_kv_block_snapshot_collects_live_allocated_blocks():
+    scheduler = make_runtime_topology_scheduler()
+    waiting, running, skipped = create_requests(num_requests=3)
+
+    scheduler.add_request(waiting)
+    scheduler.add_request(running)
+    scheduler.waiting.remove_request(running)
+    running.status = RequestStatus.RUNNING
+    scheduler.running.append(running)
+
+    skipped.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.add_request(skipped)
+    scheduler.kv_cache_manager.block_ids = {
+        running.request_id: ([2, 4, 6],),
+        skipped.request_id: ([7],),
+    }
+
+    snapshot = scheduler.collect_runtime_kv_block_ids()
+
+    assert snapshot == {
+        running.request_id: [2, 4, 6],
+        skipped.request_id: [7],
+    }
+
+
+def test_runtime_topology_kv_block_snapshot_collects_streaming_wait_session():
+    scheduler = make_runtime_topology_scheduler()
+    (session,) = create_requests(num_requests=1, req_ids=["session"])
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    session.streaming_queue = deque()
+    scheduler.requests[session.request_id] = session
+    scheduler.num_waiting_for_streaming_input = 1
+    scheduler.kv_cache_manager.block_ids = {
+        session.request_id: ([3, 5],),
+    }
+
+    snapshot = scheduler.collect_runtime_kv_block_ids()
+
+    assert snapshot == {
+        session.request_id: [3, 5],
+    }
+
+
+def test_runtime_topology_restore_migrated_kv_blocks_preserves_request_state():
+    scheduler = make_runtime_topology_scheduler()
+    waiting, running = create_requests(num_requests=2)
+
+    scheduler.add_request(waiting)
+    scheduler.add_request(running)
+    scheduler.waiting.remove_request(running)
+    running.status = RequestStatus.RUNNING
+    running.num_computed_tokens = 32
+    running.is_prefill_chunk = False
+    scheduler.running.append(running)
+
+    drained = scheduler.drain_unfinished_requests_for_runtime_kv_migration()
+
+    assert [request.request_id for request in drained] == [
+        running.request_id,
+        waiting.request_id,
+    ]
+    assert scheduler.requests == {}
+    assert scheduler.running == []
+    assert len(scheduler.waiting) == 0
+
+    for request in drained:
+        scheduler.add_request(request)
+
+    scheduler.restore_runtime_kv_blocks_for_migration(
+        request_block_ids={
+            waiting.request_id: [2],
+            running.request_id: [4, 6],
+        },
+        block_mapping={
+            2: 1,
+            4: 3,
+            6: 5,
+        },
+    )
+
+    assert running.num_computed_tokens == 32
+    assert running.status == RequestStatus.WAITING
+    assert scheduler.kv_cache_manager.restored_block_ids == {
+        waiting.request_id: [1],
+        running.request_id: [3, 5],
+    }
+    assert scheduler.running == []
+    assert len(scheduler.waiting) == 2
+
+
+def test_runtime_topology_kv_migration_drain_rolls_back_async_placeholders():
+    scheduler = make_runtime_topology_scheduler()
+    (running,) = create_requests(num_requests=1, num_tokens=10)
+
+    scheduler.add_request(running)
+    scheduler.waiting.remove_request(running)
+    running.status = RequestStatus.RUNNING
+    running.num_computed_tokens = running.num_tokens
+    running.num_output_placeholders = 1
+    running.async_tokens_to_discard = 1
+    scheduler.running.append(running)
+
+    drained = scheduler.drain_unfinished_requests_for_runtime_kv_migration()
+
+    assert drained == [running]
+    assert running.num_computed_tokens == running.num_tokens - 1
+    assert running.num_output_placeholders == 0
+    assert running.async_tokens_to_discard == 0
+
+
+def test_runtime_topology_restore_migrated_kv_blocks_claims_real_blocks():
+    scheduler = make_runtime_topology_scheduler_with_real_kv_manager()
+    req0, req1 = create_requests(num_requests=2, req_ids=["req0", "req1"])
+    scheduler.add_request(req0)
+    scheduler.add_request(req1)
+
+    scheduler.restore_runtime_kv_blocks_for_migration(
+        request_block_ids={
+            "req0": [9, 11],
+            "req1": [11],
+        },
+        block_mapping={
+            9: 2,
+            11: 4,
+        },
+    )
+
+    assert scheduler.kv_cache_manager.get_block_ids("req0") == ([2, 4],)
+    assert scheduler.kv_cache_manager.get_block_ids("req1") == ([4],)
+    block_pool = scheduler.kv_cache_manager.block_pool
+    assert block_pool.blocks[2].ref_cnt == 1
+    assert block_pool.blocks[4].ref_cnt == 2
+    free_block_ids = {
+        block.block_id for block in block_pool.free_block_queue.get_all_free_blocks()
+    }
+    assert 2 not in free_block_ids
+    assert 4 not in free_block_ids
+
+
+def test_runtime_topology_restore_migrated_kv_blocks_preserves_null_placeholders():
+    scheduler = make_runtime_topology_scheduler_with_real_kv_manager()
+    (request,) = create_requests(num_requests=1, req_ids=["req0"])
+    scheduler.add_request(request)
+
+    scheduler.restore_runtime_kv_blocks_for_migration(
+        request_block_ids={"req0": [0, 9, 0, 11]},
+        block_mapping={
+            9: 2,
+            11: 4,
+        },
+    )
+
+    assert scheduler.kv_cache_manager.get_block_ids("req0") == ([0, 2, 0, 4],)
+    block_pool = scheduler.kv_cache_manager.block_pool
+    assert block_pool.blocks[0].is_null
+    assert block_pool.blocks[0].ref_cnt == 0
+    assert block_pool.blocks[2].ref_cnt == 1
+    assert block_pool.blocks[4].ref_cnt == 1
+
+
+def test_runtime_topology_kv_migration_drain_keeps_streaming_wait_session():
+    scheduler = make_runtime_topology_scheduler()
+    (session,) = create_requests(num_requests=1, req_ids=["session"])
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    session.streaming_queue = deque()
+    scheduler.requests[session.request_id] = session
+    scheduler.num_waiting_for_streaming_input = 1
+
+    drained = scheduler.drain_unfinished_requests_for_runtime_kv_migration()
+
+    assert drained == [session]
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert session.num_computed_tokens == 16
+    assert scheduler.requests == {}
+    assert scheduler.num_waiting_for_streaming_input == 0
+
+
+def test_runtime_topology_recompute_drain_keeps_streaming_wait_session():
+    scheduler = make_runtime_topology_scheduler()
+    (session,) = create_requests(num_requests=1, req_ids=["session"])
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    session.streaming_queue = deque()
+    scheduler.requests[session.request_id] = session
+    scheduler.num_waiting_for_streaming_input = 1
+
+    drained = scheduler.drain_unfinished_requests_for_recompute(
+        reset_running_requests=True
+    )
+
+    assert drained == [session]
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert session.num_computed_tokens == 0
+    assert scheduler.requests == {}
+    assert scheduler.num_waiting_for_streaming_input == 0
 
 
 @pytest.mark.parametrize(

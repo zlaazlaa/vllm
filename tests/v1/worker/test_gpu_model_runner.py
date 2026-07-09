@@ -309,6 +309,156 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
 
 
+def test_topology_rebuild_clears_cuda_graph_state(monkeypatch: pytest.MonkeyPatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    cleanup_calls = []
+    clear_calls = []
+    reset_calls = []
+    graph_pool_reset_calls = []
+    encoder_clear_calls = []
+    runner._cleanup_profiling_kv_cache = lambda: cleanup_calls.append("kv")
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={"layer": object()}
+    )
+    runner.encoder_cudagraph_manager = SimpleNamespace(
+        clear=lambda: encoder_clear_calls.append("encoder")
+    )
+    runner.model = object()
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "clear_all_graphs",
+        classmethod(lambda cls: clear_calls.append("cuda")),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "clear_all_graphs",
+        classmethod(lambda cls: clear_calls.append("breakable")),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.workspace.reset_workspace_manager",
+        lambda: reset_calls.append("workspace"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "reset_global_graph_pool",
+        lambda: graph_pool_reset_calls.append("pool"),
+    )
+
+    runner.clear_runtime_state_for_topology_rebuild(clear_model=True)
+
+    assert cleanup_calls == ["kv"]
+    assert clear_calls == ["cuda", "breakable"]
+    assert encoder_clear_calls == ["encoder"]
+    assert graph_pool_reset_calls == ["pool"]
+    assert reset_calls == ["workspace"]
+    assert runner.compilation_config.static_forward_context == {}
+    assert runner.encoder_cudagraph_manager is None
+    assert runner.model is None
+
+
+def test_topology_rebuild_without_model_clear_keeps_cuda_graph_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    cleanup_calls = []
+    clear_calls = []
+    graph_pool_reset_calls = []
+    context_sentinel = object()
+    encoder_manager = object()
+    model = object()
+    runner._cleanup_profiling_kv_cache = lambda: cleanup_calls.append("kv")
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={"layer": context_sentinel}
+    )
+    runner.encoder_cudagraph_manager = encoder_manager
+    runner.model = model
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "clear_all_graphs",
+        classmethod(lambda cls: clear_calls.append("cuda")),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "clear_all_graphs",
+        classmethod(lambda cls: clear_calls.append("breakable")),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "reset_global_graph_pool",
+        lambda: graph_pool_reset_calls.append("pool"),
+    )
+
+    runner.clear_runtime_state_for_topology_rebuild(clear_model=False)
+
+    assert cleanup_calls == ["kv"]
+    assert clear_calls == []
+    assert graph_pool_reset_calls == []
+    assert runner.compilation_config.static_forward_context == {
+        "layer": context_sentinel
+    }
+    assert runner.encoder_cudagraph_manager is encoder_manager
+    assert runner.model is model
+
+
+def test_runtime_kv_snapshot_survives_topology_rebuild(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    cleanup_calls = []
+    clear_calls = []
+    reset_calls = []
+    graph_pool_reset_calls = []
+    kv_tensor = object()
+    runner.kv_caches = [kv_tensor]
+    runner._cleanup_profiling_kv_cache = lambda: cleanup_calls.append("kv")
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.encoder_cudagraph_manager = None
+    runner.model = object()
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "clear_all_graphs",
+        classmethod(lambda cls: clear_calls.append("cuda")),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "clear_all_graphs",
+        classmethod(lambda cls: clear_calls.append("breakable")),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.workspace.reset_workspace_manager",
+        lambda: reset_calls.append("workspace"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "reset_global_graph_pool",
+        lambda: graph_pool_reset_calls.append("pool"),
+    )
+
+    snapshot = runner.snapshot_runtime_kv_caches_for_topology_migration()
+    runner.clear_runtime_state_for_topology_rebuild(clear_model=True)
+
+    assert snapshot == [kv_tensor]
+    assert runner._runtime_topology_source_kv_caches == [kv_tensor]
+    runner.clear_runtime_kv_migration_snapshot()
+    assert runner._runtime_topology_source_kv_caches is None
+
+
+def test_runtime_kv_snapshot_uses_layer_named_kv_cache_map():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    layer_tensor = object()
+    list_tensor = object()
+    runner._runtime_topology_kv_caches_by_layer = {
+        "model.layers.0.self_attn": layer_tensor
+    }
+    runner.kv_caches = [list_tensor]
+
+    snapshot = runner.snapshot_runtime_kv_caches_for_topology_migration()
+
+    assert snapshot == {"model.layers.0.self_attn": layer_tensor}
+    assert runner._runtime_topology_source_kv_caches == snapshot
+
+
 def test_select_common_block_size_no_valid_option():
     backend_a = _make_mock_backend_for_kernel_block_size([64])
     backend_b = _make_mock_backend_for_kernel_block_size([MultipleOf(16)])

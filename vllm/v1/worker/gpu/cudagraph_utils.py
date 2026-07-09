@@ -152,6 +152,14 @@ class CudaGraphManager:
         )
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
 
+    def clear(self) -> None:
+        self.graphs.clear()
+        self._graphs_captured = False
+        if self.breakable_cg_runner is not None:
+            self.breakable_cg_runner.clear_graphs()
+            self.breakable_cg_runner = None
+        self.pool = None
+
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
         """Precompute actual num_active_loras -> effective captured case.
 
@@ -447,6 +455,12 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+
+    def clear(self) -> None:
+        super().clear()
+        self.hidden_states = None
+        self.aux_hidden_states.clear()
+        self.intermediate_tensors = None
 
     def capture(
         self,

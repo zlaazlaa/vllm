@@ -26,6 +26,7 @@ from vllm.distributed import (
     cleanup_dist_env_and_memory,
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.topology_cache import TopologyDescriptor
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -52,6 +53,12 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     resolve_kv_cache_block_sizes,
 )
+from vllm.v1.core.kv_cache_migration import (
+    RuntimeKVMigrationPolicy,
+    build_global_runtime_kv_cache_config,
+    build_runtime_kv_block_mapping,
+    build_runtime_kv_migration_plan,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -72,9 +79,13 @@ from vllm.v1.engine import (
 )
 from vllm.v1.engine.runtime_topology import (
     RuntimeTopologySwitchRequest,
+    RuntimeTopologySwitchPlan,
+    RuntimeTopologyWorkload,
     apply_runtime_topology_to_config,
     collect_runtime_topology_keys,
+    recommend_runtime_topology,
     topology_descriptor_to_dict,
+    topology_recommendation_to_dict,
     validate_runtime_topology_switch,
 )
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
@@ -287,10 +298,118 @@ class EngineCore:
         for request in drained_requests:
             self.scheduler.add_request(request)
 
+    @staticmethod
+    def _count_live_runtime_kv_blocks(
+        request_block_ids: dict[str, list[int]],
+    ) -> int:
+        return len(
+            {
+                block_id
+                for block_ids in request_block_ids.values()
+                for block_id in block_ids
+                if block_id != 0
+            }
+        )
+
+    @staticmethod
+    def _reset_drained_requests_for_runtime_topology_recompute(
+        drained_requests: list[Request],
+    ) -> None:
+        for request in drained_requests:
+            request.num_computed_tokens = 0
+            request.spec_token_ids = []
+            request.num_output_placeholders = 0
+            request.async_tokens_to_discard = 0
+            request.next_decode_eligible_step = 0
+            request.last_sched_seq = 0
+            request.is_prefill_chunk = False
+            request.kv_transfer_params = None
+
+    def _prepare_runtime_kv_migration(
+        self,
+        *,
+        switch_plan: RuntimeTopologySwitchPlan,
+        kv_cache_config: KVCacheConfig,
+        request_block_ids: dict[str, list[int]],
+        snapshot_error: str | None,
+    ) -> dict[str, int | str]:
+        target_num_blocks = getattr(kv_cache_config, "num_blocks", 0)
+        if snapshot_error is not None:
+            summary: dict[str, int | str] = {
+                "policy": RuntimeKVMigrationPolicy.RECOMPUTE.value,
+                "reason": "kv_block_snapshot_unavailable",
+                "live_blocks": 0,
+                "target_num_blocks": target_num_blocks,
+                "detail": snapshot_error,
+            }
+            self._runtime_kv_migration_preparation = {
+                "summary": summary,
+                "request_block_ids": {},
+            }
+            return summary
+
+        live_blocks = self._count_live_runtime_kv_blocks(request_block_ids)
+        if live_blocks == 0:
+            summary = {
+                "policy": RuntimeKVMigrationPolicy.RECOMPUTE.value,
+                "reason": "no_live_blocks",
+                "live_blocks": 0,
+                "target_num_blocks": target_num_blocks,
+            }
+            self._runtime_kv_migration_preparation = {
+                "summary": summary,
+                "request_block_ids": {},
+            }
+            return summary
+
+        try:
+            block_mapping = build_runtime_kv_block_mapping(
+                request_block_ids=request_block_ids,
+                target_num_blocks=kv_cache_config.num_blocks,
+            )
+            kv_migration_plan = build_runtime_kv_migration_plan(
+                source_topology=switch_plan.previous_topology,
+                target_topology=switch_plan.target_topology,
+                kv_cache_config=kv_cache_config,
+                live_blocks=block_mapping.live_blocks,
+            )
+        except ValueError as e:
+            reason = (
+                "insufficient_target_kv_capacity"
+                if "target KV capacity" in str(e)
+                else "kv_migration_unavailable"
+            )
+            summary = {
+                "policy": RuntimeKVMigrationPolicy.RECOMPUTE.value,
+                "reason": reason,
+                "live_blocks": live_blocks,
+                "target_num_blocks": kv_cache_config.num_blocks,
+                "detail": str(e),
+            }
+            self._runtime_kv_migration_preparation = {
+                "summary": summary,
+                "request_block_ids": request_block_ids,
+            }
+            return summary
+
+        summary = {
+            "policy": kv_migration_plan.policy.value,
+            "reason": kv_migration_plan.reason,
+            "live_blocks": block_mapping.live_blocks,
+            "target_num_blocks": kv_migration_plan.target_num_blocks,
+        }
+        self._runtime_kv_migration_preparation = {
+            "summary": summary,
+            "request_block_ids": request_block_ids,
+            "block_mapping": block_mapping.block_mapping,
+            "plan": kv_migration_plan,
+        }
+        return summary
+
     def switch_runtime_topology(
         self,
         request: RuntimeTopologySwitchRequest | dict[str, int],
-    ) -> dict[str, dict[str, int]]:
+    ) -> dict[str, Any] | Future[dict[str, Any]]:
         if isinstance(request, dict):
             request = RuntimeTopologySwitchRequest(**request)
         prebuilt_topology_keys = getattr(
@@ -309,16 +428,46 @@ class EngineCore:
             prebuilt_topology_keys,
         )
 
-        self.pause_scheduler(mode="keep", clear_cache=False)
+        pause_future = self.pause_scheduler(mode="keep", clear_cache=False)
+        if pause_future is None:
+            return self._switch_runtime_topology_after_pause(plan)
+
+        switch_future: Future[dict[str, Any]] = Future()
+
+        def on_pause_complete(future: Future) -> None:
+            try:
+                future.result()
+                switch_future.set_result(
+                    self._switch_runtime_topology_after_pause(plan)
+                )
+            except BaseException as e:
+                switch_future.set_exception(e)
+
+        pause_future.add_done_callback(on_pause_complete)
+        return switch_future
+
+    def _switch_runtime_topology_after_pause(
+        self,
+        plan: RuntimeTopologySwitchPlan,
+    ) -> dict[str, Any]:
         try:
+            runtime_kv_block_ids: dict[str, list[int]] = {}
+            runtime_kv_snapshot_error: str | None = None
+            runtime_kv_snapshot_saved = False
+            try:
+                runtime_kv_block_ids = (
+                    self.scheduler.collect_runtime_kv_block_ids()
+                )
+            except ValueError as e:
+                runtime_kv_snapshot_error = str(e)
+            else:
+                if self._count_live_runtime_kv_blocks(runtime_kv_block_ids) > 0:
+                    self.model_executor.snapshot_runtime_kv_caches_for_topology_migration()
+                    runtime_kv_snapshot_saved = True
+
             batch_queue = getattr(self, "batch_queue", None)
             if batch_queue is not None:
                 batch_queue.clear()
-            drained_requests = (
-                self.scheduler.drain_unfinished_requests_for_recompute(
-                    reset_running_requests=True
-                )
-            )
             apply_runtime_topology_to_config(
                 self.vllm_config,
                 plan.target_topology,
@@ -331,10 +480,105 @@ class EngineCore:
             )
             self.model_executor.rebuild_model_for_runtime_topology()
             kv_cache_config = self._initialize_kv_caches(self.vllm_config)
+            migration_kv_cache_config = getattr(
+                self,
+                "_runtime_global_kv_cache_config",
+                kv_cache_config,
+            )
+            kv_cache_migration = self._prepare_runtime_kv_migration(
+                switch_plan=plan,
+                kv_cache_config=migration_kv_cache_config,
+                request_block_ids=runtime_kv_block_ids,
+                snapshot_error=runtime_kv_snapshot_error,
+            )
+            kv_cache_migration["request_state"] = "recompute"
+            runtime_kv_restore: tuple[
+                dict[str, list[int]],
+                dict[int, int],
+            ] | None = None
+            if kv_cache_migration["policy"] == RuntimeKVMigrationPolicy.MIGRATE.value:
+                try:
+                    migration_prep = self._runtime_kv_migration_preparation
+                    migration_stats = (
+                        self.model_executor.migrate_runtime_kv_cache_for_topology(
+                            plan=migration_prep["plan"],
+                            block_mapping=migration_prep["block_mapping"],
+                            max_blocks_per_step=1,
+                        )
+                    )
+                    kv_cache_migration.update(migration_stats)
+                    kv_cache_migration["request_state"] = "migrated"
+                    runtime_kv_restore = (
+                        runtime_kv_block_ids,
+                        migration_prep["block_mapping"],
+                    )
+                except Exception as e:
+                    logger.exception("Runtime KV cache migration failed")
+                    kv_cache_migration = {
+                        "policy": RuntimeKVMigrationPolicy.RECOMPUTE.value,
+                        "reason": "kv_migration_execution_failed",
+                        "request_state": "recompute",
+                        "live_blocks": kv_cache_migration["live_blocks"],
+                        "target_num_blocks": kv_cache_migration[
+                            "target_num_blocks"
+                        ],
+                        "detail": str(e),
+                    }
+                    self._runtime_kv_migration_preparation["summary"] = (
+                        kv_cache_migration
+                    )
+                finally:
+                    if runtime_kv_snapshot_saved:
+                        self.model_executor.clear_runtime_kv_migration_snapshot()
+            elif runtime_kv_snapshot_saved:
+                self.model_executor.clear_runtime_kv_migration_snapshot()
+
+            if runtime_kv_restore is not None:
+                drained_requests = (
+                    self.scheduler
+                    .drain_unfinished_requests_for_runtime_kv_migration()
+                )
+            else:
+                drained_requests = (
+                    self.scheduler.drain_unfinished_requests_for_recompute(
+                        reset_running_requests=True
+                    )
+                )
             self._rebuild_scheduler_for_runtime_topology(
                 kv_cache_config,
                 drained_requests,
             )
+            if runtime_kv_restore is not None:
+                try:
+                    request_block_ids, block_mapping = runtime_kv_restore
+                    self.scheduler.restore_runtime_kv_blocks_for_migration(
+                        request_block_ids,
+                        block_mapping,
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "Runtime KV cache scheduler restore failed"
+                    )
+                    self._reset_drained_requests_for_runtime_topology_recompute(
+                        drained_requests
+                    )
+                    kv_cache_migration = {
+                        "policy": RuntimeKVMigrationPolicy.RECOMPUTE.value,
+                        "reason": "kv_migration_scheduler_restore_failed",
+                        "request_state": "recompute",
+                        "live_blocks": kv_cache_migration["live_blocks"],
+                        "target_num_blocks": kv_cache_migration[
+                            "target_num_blocks"
+                        ],
+                        "detail": str(e),
+                    }
+                    self._runtime_kv_migration_preparation["summary"] = (
+                        kv_cache_migration
+                    )
+                    self._rebuild_scheduler_for_runtime_topology(
+                        kv_cache_config,
+                        drained_requests,
+                    )
         except BaseException:
             logger.exception("Runtime topology switch failed")
             raise
@@ -344,7 +588,21 @@ class EngineCore:
         return {
             "previous": topology_descriptor_to_dict(plan.previous_topology),
             "target": topology_descriptor_to_dict(plan.target_topology),
+            "kv_cache_migration": kv_cache_migration,
         }
+
+    def recommend_runtime_topology(self) -> dict[str, Any]:
+        num_running_requests, num_waiting_requests = (
+            self.scheduler.get_request_counts()
+        )
+        recommendation = recommend_runtime_topology(
+            self.vllm_config,
+            RuntimeTopologyWorkload(
+                num_running_requests=num_running_requests,
+                num_waiting_requests=num_waiting_requests,
+            ),
+        )
+        return topology_recommendation_to_dict(recommendation)
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -413,6 +671,31 @@ class EngineCore:
 
             kv_cache_configs = get_kv_cache_configs(
                 vllm_config, kv_cache_specs, available_gpu_memory
+            )
+            self._runtime_global_kv_cache_config = (
+                build_global_runtime_kv_cache_config(
+                    kv_cache_configs,
+                    target_topology=TopologyDescriptor(
+                        world_size=vllm_config.parallel_config.world_size,
+                        tensor_parallel_size=(
+                            vllm_config.parallel_config.tensor_parallel_size
+                        ),
+                        pipeline_parallel_size=(
+                            vllm_config.parallel_config.pipeline_parallel_size
+                        ),
+                        prefill_context_parallel_size=(
+                            vllm_config.parallel_config
+                            .prefill_context_parallel_size
+                        ),
+                        decode_context_parallel_size=(
+                            vllm_config.parallel_config
+                            .decode_context_parallel_size
+                        ),
+                        data_parallel_size=(
+                            vllm_config.parallel_config.data_parallel_size
+                        ),
+                    ),
+                )
             )
 
             # If auto-fit reduced max_model_len, sync the new value to workers.
@@ -1394,9 +1677,12 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
+        input_barrier = False
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
-            self._notify_idle_state_callbacks()
+            if self._notify_idle_state_callbacks():
+                input_barrier = True
+                break
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
@@ -1407,8 +1693,10 @@ class EngineCoreProc(EngineCore):
             block = self.process_input_queue_block
             try:
                 req = self.input_queue.get(block=block)
-                self._handle_client_request(*req)
+                input_barrier = self._handle_client_request(*req)
             except queue.Empty:
+                break
+            if input_barrier:
                 break
             if not block:
                 break
@@ -1416,10 +1704,14 @@ class EngineCoreProc(EngineCore):
         if waited:
             logger.debug("EngineCore loop active.")
 
+        if input_barrier:
+            return
+
         # Handle any more client requests.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+            if self._handle_client_request(*req):
+                return
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -1440,10 +1732,12 @@ class EngineCoreProc(EngineCore):
 
         return model_executed
 
-    def _notify_idle_state_callbacks(self) -> None:
+    def _notify_idle_state_callbacks(self) -> bool:
+        had_callbacks = bool(self._idle_state_callbacks)
         while self._idle_state_callbacks:
             callback = self._idle_state_callbacks.pop()
             callback(self)
+        return had_callbacks
 
     def _handle_shutdown(self) -> bool:
         # Check if shutdown was requested and handle it
@@ -1495,22 +1789,22 @@ class EngineCoreProc(EngineCore):
 
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
-    ) -> None:
+    ) -> bool:
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.WAKEUP:
-            return
+            return False
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
-                return
+                return False
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
             client_idx, call_id, method_name, args = request
             if self._reject_utility_in_shutdown(client_idx, call_id, method_name):
-                return
+                return False
             output = UtilityOutput(call_id)
             # Lazily look-up utility method so that failure will be handled/returned.
             get_result = lambda: (
@@ -1520,13 +1814,19 @@ class EngineCoreProc(EngineCore):
             enqueue_output = lambda out: self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=out))
             )
-            self._invoke_utility_method(method_name, get_result, output, enqueue_output)
+            return self._invoke_utility_method(
+                method_name,
+                get_result,
+                output,
+                enqueue_output,
+            )
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
         else:
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
             )
+        return False
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -1558,7 +1858,7 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def _invoke_utility_method(
         name: str, get_result: Callable, output: UtilityOutput, enqueue_output: Callable
-    ):
+    ) -> bool:
         try:
             result = get_result()
             if isinstance(result, Future):
@@ -1567,12 +1867,13 @@ class EngineCoreProc(EngineCore):
                     name, future.result, output, enqueue_output
                 )
                 result.add_done_callback(callback)
-                return
+                return True
             output.result = UtilityResult(result)
         except Exception as e:
             logger.exception("Invocation of %s method failed", name)
             output.failure_message = f"Call to {name} method failed: {str(e)}"
         enqueue_output(output)
+        return False
 
     @staticmethod
     def _convert_msgspec_args(method, args):
@@ -2006,10 +2307,10 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
-    ) -> None:
+    ) -> bool:
         if request_type == EngineCoreRequestType.START_DP_WAVE:
             if self.ignore_start_dp_wave:
-                return
+                return False
             new_wave, exclude_eng_index = request
             if exclude_eng_index != self.engine_index and (
                 new_wave >= self.current_wave
@@ -2021,8 +2322,9 @@ class DPEngineCoreProc(EngineCoreProc):
                         new_wave,
                     )
                     self.engines_running = True
+            return False
         else:
-            super()._handle_client_request(request_type, request)
+            return super()._handle_client_request(request_type, request)
 
     def _maybe_publish_request_counts(self):
         if not self.publish_dp_lb_stats:

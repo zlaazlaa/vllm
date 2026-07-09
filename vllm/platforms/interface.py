@@ -1136,6 +1136,13 @@ class Platform:
             cls._global_graph_pool = self.graph_pool_handle()
         return cls._global_graph_pool
 
+    def reset_global_graph_pool(self) -> None:
+        """
+        Drop the cached graph pool handle so the next CUDA graph capture
+        allocates a fresh pool.
+        """
+        self.__class__._global_graph_pool = None
+
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
         """

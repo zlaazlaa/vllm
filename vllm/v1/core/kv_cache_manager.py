@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -592,6 +592,18 @@ class KVCacheManager:
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
+
+    def restore_runtime_kv_blocks(
+        self,
+        request_block_ids: Mapping[str, Sequence[int]],
+    ) -> None:
+        """Restore scheduler ownership for runtime-migrated KV blocks."""
+        if self.num_kv_cache_groups != 1:
+            raise ValueError(
+                "runtime KV migration restore currently supports a single "
+                f"KV cache group, got {self.num_kv_cache_groups}"
+            )
+        self.coordinator.restore_runtime_kv_blocks(request_block_ids)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.

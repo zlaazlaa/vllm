@@ -5,7 +5,7 @@
 import gc
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
@@ -70,6 +70,12 @@ from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.core.kv_cache_migration import (
+    RuntimeKVMigrationPlan,
+    RuntimeKVSourceTensor,
+    get_runtime_topology_kv_rank,
+    migrate_runtime_kv_cache_shard,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -460,6 +466,170 @@ class Worker(WorkerBase):
         )
         self._init_model_runner()
         self.load_model()
+
+    def snapshot_runtime_kv_caches_for_topology_migration(self) -> None:
+        self._runtime_topology_source_kv_caches = (
+            self.model_runner.snapshot_runtime_kv_caches_for_topology_migration()
+        )
+
+    def clear_runtime_kv_migration_snapshot(self) -> None:
+        self._runtime_topology_source_kv_caches = None
+        self.model_runner.clear_runtime_kv_migration_snapshot()
+
+    def export_runtime_kv_source_shard_for_migration(
+        self,
+        plan: RuntimeKVMigrationPlan,
+        layer_names: Sequence[str] | None = None,
+        block_ids: Sequence[int] | None = None,
+        head_indices: Sequence[int] | None = None,
+    ) -> dict[str, Any] | None:
+        source_kv_caches = getattr(
+            self,
+            "_runtime_topology_source_kv_caches",
+            None,
+        )
+        if source_kv_caches is None:
+            return None
+        if not isinstance(source_kv_caches, dict):
+            raise ValueError(
+                "runtime KV migration requires layer-name KV cache snapshots"
+            )
+
+        pp_rank, tp_rank = get_runtime_topology_kv_rank(
+            plan.source_topology,
+            rank=self.rank,
+        )
+        selected_global_heads: tuple[int, ...] | None = None
+        selected_local_heads: tuple[int, ...] | None = None
+        if head_indices is not None:
+            global_num_kv_heads = plan.global_num_kv_heads or sum(
+                len(partition.head_indices) for partition in plan.tp_partitions
+            )
+            if global_num_kv_heads % plan.source_topology.tensor_parallel_size != 0:
+                raise ValueError(
+                    "runtime KV source head slicing requires KV heads to be "
+                    "divisible by source tensor parallel size"
+                )
+            heads_per_source_rank = (
+                global_num_kv_heads // plan.source_topology.tensor_parallel_size
+            )
+            source_head_start = tp_rank * heads_per_source_rank
+            source_head_stop = source_head_start + heads_per_source_rank
+            selected_global_heads = tuple(
+                head_index
+                for head_index in head_indices
+                if source_head_start <= head_index < source_head_stop
+            )
+            if not selected_global_heads:
+                return None
+            selected_local_heads = tuple(
+                head_index - source_head_start
+                for head_index in selected_global_heads
+            )
+
+        kv_caches: dict[str, torch.Tensor | RuntimeKVSourceTensor] = {}
+        requested_layers = set(layer_names) if layer_names is not None else None
+        for layer_name, tensor in source_kv_caches.items():
+            if requested_layers is not None and layer_name not in requested_layers:
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(
+                    "runtime KV migration source snapshots must contain tensors; "
+                    f"layer {layer_name!r} has {type(tensor)!r}"
+                )
+            source_tensor = tensor.detach()
+            if block_ids is not None:
+                block_id_tuple = tuple(block_ids)
+                if any(block_id < 0 for block_id in block_id_tuple):
+                    raise ValueError("runtime KV source block ids must be >= 0")
+                if any(
+                    block_id >= source_tensor.shape[0]
+                    for block_id in block_id_tuple
+                ):
+                    raise ValueError(
+                        "runtime KV source block id exceeds source shard "
+                        f"capacity {source_tensor.shape[0]}"
+                    )
+                block_index = torch.tensor(
+                    block_id_tuple,
+                    dtype=torch.long,
+                    device=source_tensor.device,
+                )
+                source_tensor = source_tensor.index_select(0, block_index)
+            if selected_local_heads is not None:
+                head_index = torch.tensor(
+                    selected_local_heads,
+                    dtype=torch.long,
+                    device=source_tensor.device,
+                )
+                source_tensor = source_tensor.index_select(3, head_index)
+                assert selected_global_heads is not None
+                kv_caches[layer_name] = RuntimeKVSourceTensor(
+                    tensor=source_tensor.cpu().clone(),
+                    head_indices=selected_global_heads,
+                )
+            else:
+                kv_caches[layer_name] = source_tensor.cpu().clone()
+        if not kv_caches:
+            return None
+
+        return {
+            "rank": self.rank,
+            "pp_rank": pp_rank,
+            "tp_rank": tp_rank,
+            "kv_caches": kv_caches,
+        }
+
+    def migrate_runtime_kv_cache_for_topology(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        source_kv_caches: dict[tuple[int, int], dict[str, torch.Tensor]],
+        block_mapping: dict[int, int],
+        max_blocks_per_step: int,
+    ) -> dict[str, int]:
+        target_kv_caches = getattr(
+            self.model_runner,
+            "_runtime_topology_kv_caches_by_layer",
+            None,
+        )
+        if target_kv_caches is None:
+            raise ValueError(
+                "runtime KV migration requires layer-name target KV caches"
+            )
+        target_pp_rank, target_tp_rank = get_runtime_topology_kv_rank(
+            plan.target_topology,
+            rank=self.rank,
+        )
+        if not any(
+            partition.pp_rank == target_pp_rank
+            for partition in plan.pp_partitions
+        ):
+            return {
+                "migration_steps": 0,
+                "tensor_copies": 0,
+            }
+        if not any(
+            partition.tp_rank == target_tp_rank
+            for partition in plan.tp_partitions
+        ):
+            return {
+                "migration_steps": 0,
+                "tensor_copies": 0,
+            }
+        stats = migrate_runtime_kv_cache_shard(
+            plan=plan,
+            source_kv_caches=source_kv_caches,
+            target_kv_caches=target_kv_caches,
+            target_pp_rank=target_pp_rank,
+            target_tp_rank=target_tp_rank,
+            block_mapping=block_mapping,
+            max_blocks_per_step=max_blocks_per_step,
+        )
+        return {
+            "migration_steps": stats.migration_steps,
+            "tensor_copies": stats.tensor_copies,
+        }
 
     def clear_runtime_kv_state(self) -> None:
         self.model_runner.clear_runtime_state_for_topology_rebuild(

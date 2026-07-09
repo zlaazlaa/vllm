@@ -316,6 +316,69 @@ class SingleTypeKVCacheManager(ABC):
         self.new_block_ids = []
         return ids
 
+    def restore_runtime_kv_blocks(
+        self,
+        request_id: str,
+        block_ids: Sequence[int],
+    ) -> None:
+        """Restore migrated block ownership for a single request.
+
+        Runtime topology migration has already copied tensor data into the
+        target block IDs. This method only reconstructs scheduler ownership
+        metadata and intentionally does not mark these blocks as newly
+        allocated, so the worker will not zero them.
+        """
+        if self.req_to_blocks.get(request_id):
+            raise ValueError(
+                "runtime KV migration can only restore into an unallocated "
+                f"request; {request_id!r} already has KV blocks"
+            )
+
+        seen_block_ids: set[int] = set()
+        blocks: list[KVCacheBlock] = []
+        for block_id in block_ids:
+            if block_id == 0:
+                blocks.append(self._null_block)
+                continue
+            if block_id in seen_block_ids:
+                raise ValueError(
+                    "runtime KV migration restore got duplicate block id "
+                    f"{block_id} for request {request_id!r}"
+                )
+            seen_block_ids.add(block_id)
+            if block_id < 0:
+                raise ValueError(
+                    "runtime KV migration target block ids must be "
+                    f"non-negative; got {block_id}"
+                )
+            if block_id >= len(self.block_pool.blocks):
+                raise ValueError(
+                    "runtime KV migration target block id exceeds capacity; "
+                    f"got {block_id} >= {len(self.block_pool.blocks)}"
+                )
+            block = self.block_pool.blocks[block_id]
+            if block.is_null:
+                raise ValueError(
+                    "runtime KV migration cannot restore into a null block; "
+                    f"got block id {block_id}"
+                )
+            blocks.append(block)
+
+        for block in blocks:
+            if block.is_null:
+                continue
+            if block.ref_cnt == 0:
+                self.block_pool.free_block_queue.remove(block)
+                if self.block_pool.metrics_collector:
+                    self.block_pool.metrics_collector.on_block_allocated(block)
+            elif self.block_pool.metrics_collector:
+                self.block_pool.metrics_collector.on_block_accessed(block)
+            self.block_pool._maybe_evict_cached_block(block)
+            block.ref_cnt += 1
+
+        self.req_to_blocks[request_id] = blocks
+        self.num_cached_block[request_id] = 0
+
     def cache_blocks(
         self,
         request: Request,

@@ -815,6 +815,9 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             pipeline_parallel_size=pipeline_parallel_size,
         )
 
+    def recommend_runtime_topology(self) -> dict[str, Any]:
+        return self.llm_engine.recommend_runtime_topology()
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         """
         Put the engine to sleep. The engine should not process any requests.

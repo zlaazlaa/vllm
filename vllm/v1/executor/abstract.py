@@ -4,6 +4,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
+from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Literal, TypeVar, overload
 
@@ -19,6 +20,11 @@ from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.core.kv_cache_migration import (
+    RuntimeKVHeadPartition,
+    RuntimeKVLayerPartition,
+    RuntimeKVMigrationPlan,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -289,8 +295,146 @@ class Executor(ABC):
     def rebuild_model_for_runtime_topology(self) -> None:
         self.collective_rpc("rebuild_model_for_runtime_topology")
 
+    def snapshot_runtime_kv_caches_for_topology_migration(self) -> None:
+        self.collective_rpc("snapshot_runtime_kv_caches_for_topology_migration")
+
+    def clear_runtime_kv_migration_snapshot(self) -> None:
+        self.collective_rpc("clear_runtime_kv_migration_snapshot")
+
     def clear_runtime_kv_state(self) -> None:
         self.collective_rpc("clear_runtime_kv_state")
+
+    def migrate_runtime_kv_cache_for_topology(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        block_mapping: dict[int, int],
+        max_blocks_per_step: int = 1,
+    ) -> dict[str, int]:
+        if max_blocks_per_step < 1:
+            raise ValueError("max_blocks_per_step must be >= 1")
+
+        migration_steps = 0
+        tensor_copies = 0
+        source_shard_keys: set[tuple[int, int]] = set()
+        source_block_ids = tuple(block_mapping)
+
+        def collect_source_kv_caches(
+            *,
+            layer_names: tuple[str, ...],
+            block_ids: tuple[int, ...],
+            head_indices: tuple[int, ...],
+        ) -> dict[tuple[int, int], object]:
+            kwargs: dict[str, object] = {"layer_names": layer_names}
+            if block_ids:
+                kwargs["block_ids"] = block_ids
+            if head_indices:
+                kwargs["head_indices"] = head_indices
+            source_shards = self.collective_rpc(
+                "export_runtime_kv_source_shard_for_migration",
+                args=(plan,),
+                kwargs=kwargs,
+            )
+            source_kv_caches = {}
+            for shard in source_shards:
+                if shard is None:
+                    continue
+                shard_key = (shard["pp_rank"], shard["tp_rank"])
+                if shard_key in source_kv_caches:
+                    raise ValueError(
+                        "duplicate runtime KV source shard for "
+                        f"pp={shard_key[0]}, tp={shard_key[1]}"
+                    )
+                source_kv_caches[shard_key] = shard["kv_caches"]
+            if not source_kv_caches:
+                raise ValueError("runtime KV migration has no source shards")
+            return source_kv_caches
+
+        for pp_partition in plan.pp_partitions:
+            for layer_index in pp_partition.layer_indices:
+                layer_names = (plan.layer_names[layer_index],)
+                layer_partition = RuntimeKVLayerPartition(
+                    pp_rank=pp_partition.pp_rank,
+                    layer_indices=range(layer_index, layer_index + 1),
+                )
+                block_batches = [
+                    source_block_ids[
+                        block_start : block_start + max_blocks_per_step
+                    ]
+                    for block_start in range(
+                        0,
+                        len(source_block_ids),
+                        max_blocks_per_step,
+                    )
+                ] or [()]
+                for block_ids in block_batches:
+                    for tp_partition in plan.tp_partitions:
+                        source_kv_caches = collect_source_kv_caches(
+                            layer_names=layer_names,
+                            block_ids=block_ids,
+                            head_indices=tuple(tp_partition.head_indices),
+                        )
+
+                        source_shard_keys.update(source_kv_caches)
+                        batch_block_mapping = {
+                            local_block_id: block_mapping[source_block_id]
+                            for local_block_id, source_block_id in enumerate(
+                                block_ids
+                            )
+                        }
+                        head_partition = RuntimeKVHeadPartition(
+                            tp_rank=tp_partition.tp_rank,
+                            head_indices=range(
+                                tp_partition.head_indices.start,
+                                tp_partition.head_indices.stop,
+                            ),
+                        )
+                        batch_plan = (
+                            plan
+                            if (
+                                len(block_ids) == plan.live_blocks
+                                and len(source_block_ids) == plan.live_blocks
+                                and source_block_ids == block_ids
+                                and batch_block_mapping == block_mapping
+                                and len(plan.pp_partitions) == 1
+                                and pp_partition.layer_indices
+                                == layer_partition.layer_indices
+                                and len(plan.tp_partitions) == 1
+                                and tp_partition.head_indices
+                                == head_partition.head_indices
+                            )
+                            else replace(
+                                plan,
+                                pp_partitions=[layer_partition],
+                                tp_partitions=[head_partition],
+                                live_blocks=len(block_ids),
+                            )
+                        )
+                        worker_stats = self.collective_rpc(
+                            "migrate_runtime_kv_cache_for_topology",
+                            kwargs=dict(
+                                plan=batch_plan,
+                                source_kv_caches=source_kv_caches,
+                                block_mapping=batch_block_mapping,
+                                max_blocks_per_step=max_blocks_per_step,
+                            ),
+                        )
+                        migration_steps += sum(
+                            int(stats["migration_steps"])
+                            for stats in worker_stats
+                        )
+                        tensor_copies += sum(
+                            int(stats["tensor_copies"]) for stats in worker_stats
+                        )
+
+        if not source_shard_keys:
+            raise ValueError("runtime KV migration has no source shards")
+
+        return {
+            "migration_steps": migration_steps,
+            "tensor_copies": tensor_copies,
+            "source_shards": len(source_shard_keys),
+        }
 
     @abstractmethod
     def check_health(self) -> None:

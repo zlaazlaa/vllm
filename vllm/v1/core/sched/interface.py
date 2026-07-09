@@ -234,6 +234,27 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def collect_runtime_kv_block_ids(self) -> dict[str, list[int]]:
+        """Collect per-request allocated KV block ids for runtime migration."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def drain_unfinished_requests_for_runtime_kv_migration(
+        self,
+    ) -> list["Request"]:
+        """Drain unfinished requests while preserving computed-token state."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def restore_runtime_kv_blocks_for_migration(
+        self,
+        request_block_ids: dict[str, list[int]],
+        block_mapping: dict[int, int],
+    ) -> None:
+        """Restore remapped KV block ownership after runtime migration."""
+        raise NotImplementedError
+
+    @abstractmethod
     def make_stats(self) -> "SchedulerStats | None":
         """Make a SchedulerStats object for logging.
 

@@ -546,6 +546,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self._runtime_topology_kv_caches_by_layer: dict[str, torch.Tensor] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -6381,8 +6382,33 @@ class GPUModelRunner(
         if not clear_model:
             return
 
+        from vllm.v1.worker.workspace import reset_workspace_manager
+
+        CUDAGraphWrapper.clear_all_graphs()
+        BreakableCUDAGraphWrapper.clear_all_graphs()
+        if self.encoder_cudagraph_manager is not None:
+            self.encoder_cudagraph_manager.clear()
+        self.encoder_cudagraph_manager = None
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
+        current_platform.reset_global_graph_pool()
+        reset_workspace_manager()
+
+    def snapshot_runtime_kv_caches_for_topology_migration(self):
+        kv_caches = getattr(self, "_runtime_topology_kv_caches_by_layer", None)
+        if kv_caches is None:
+            kv_caches = getattr(self, "kv_caches", None)
+        if kv_caches is None:
+            snapshot = None
+        elif isinstance(kv_caches, dict):
+            snapshot = dict(kv_caches)
+        else:
+            snapshot = list(kv_caches)
+        self._runtime_topology_source_kv_caches = snapshot
+        return snapshot
+
+    def clear_runtime_kv_migration_snapshot(self) -> None:
+        self._runtime_topology_source_kv_caches = None
 
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
@@ -7351,6 +7377,7 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        self._runtime_topology_kv_caches_by_layer = dict(kv_caches)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

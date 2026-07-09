@@ -439,6 +439,9 @@ class LLMEngine:
             pipeline_parallel_size,
         )
 
+    def recommend_runtime_topology(self) -> dict[str, Any]:
+        return self.engine_core.recommend_runtime_topology()
+
     def _get_driver_model_for_cleanup(self) -> nn.Module | None:
         driver_worker = getattr(self.model_executor, "driver_worker", None)
         model_runner = getattr(driver_worker, "model_runner", None)

@@ -986,6 +986,9 @@ class AsyncLLM(EngineClient):
             pipeline_parallel_size,
         )
 
+    async def recommend_runtime_topology(self) -> dict[str, Any]:
+        return await self.engine_core.recommend_runtime_topology_async()
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()
