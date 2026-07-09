@@ -15,6 +15,8 @@ from vllm.v1.core.kv_cache_migration import (
     build_runtime_kv_block_mapping,
     build_runtime_kv_migration_plan,
     get_runtime_topology_kv_rank,
+    get_runtime_topology_rank,
+    iter_runtime_kv_p2p_transfers,
     migrate_runtime_kv_cache,
     migrate_runtime_kv_cache_shard,
     iter_layerwise_kv_migration_steps,
@@ -209,6 +211,100 @@ def test_runtime_topology_kv_rank_maps_global_rank_to_pp_and_tp():
     assert get_runtime_topology_kv_rank(descriptor, rank=1) == (0, 1)
     assert get_runtime_topology_kv_rank(descriptor, rank=2) == (1, 0)
     assert get_runtime_topology_kv_rank(descriptor, rank=3) == (1, 1)
+
+
+def test_runtime_topology_rank_maps_pp_and_tp_to_global_rank():
+    descriptor = TopologyDescriptor(
+        world_size=4,
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+    )
+
+    assert get_runtime_topology_rank(descriptor, pp_rank=0, tp_rank=0) == 0
+    assert get_runtime_topology_rank(descriptor, pp_rank=0, tp_rank=1) == 1
+    assert get_runtime_topology_rank(descriptor, pp_rank=1, tp_rank=0) == 2
+    assert get_runtime_topology_rank(descriptor, pp_rank=1, tp_rank=1) == 3
+
+
+def test_runtime_kv_p2p_transfer_plan_splits_target_heads_by_source_rank():
+    plan = RuntimeKVMigrationPlan(
+        source_topology=TopologyDescriptor(
+            world_size=2,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+        ),
+        target_topology=TopologyDescriptor(
+            world_size=2,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+        ),
+        policy=RuntimeKVMigrationPolicy.MIGRATE,
+        reason="capacity_available",
+        pp_partitions=[
+            RuntimeKVLayerPartition(pp_rank=0, layer_indices=range(0, 1)),
+        ],
+        tp_partitions=[
+            RuntimeKVHeadPartition(tp_rank=0, head_indices=range(0, 4)),
+        ],
+        live_blocks=2,
+        target_num_blocks=8,
+        layer_names=(
+            "model.layers.0.self_attn",
+            "model.layers.1.self_attn",
+        ),
+        global_num_kv_heads=4,
+    )
+
+    transfers = list(
+        iter_runtime_kv_p2p_transfers(
+            plan,
+            block_ids=(3, 5),
+        )
+    )
+
+    assert [
+        (
+            transfer.source_rank,
+            transfer.target_rank,
+            transfer.layer_name,
+            transfer.block_ids,
+            transfer.head_indices,
+        )
+        for transfer in transfers
+    ] == [
+        (0, 0, "model.layers.0.self_attn", (3, 5), (0, 1)),
+        (1, 0, "model.layers.0.self_attn", (3, 5), (2, 3)),
+    ]
+
+
+def test_runtime_kv_p2p_transfer_plan_rejects_recompute_policy():
+    plan = RuntimeKVMigrationPlan(
+        source_topology=TopologyDescriptor(
+            world_size=1,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        target_topology=TopologyDescriptor(
+            world_size=1,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        policy=RuntimeKVMigrationPolicy.RECOMPUTE,
+        reason="insufficient_target_kv_capacity",
+        pp_partitions=[
+            RuntimeKVLayerPartition(pp_rank=0, layer_indices=range(0, 1)),
+        ],
+        tp_partitions=[
+            RuntimeKVHeadPartition(tp_rank=0, head_indices=range(0, 1)),
+        ],
+        live_blocks=1,
+        target_num_blocks=0,
+        layer_names=("model.layers.0.self_attn",),
+        global_num_kv_heads=1,
+    )
+
+    with pytest.raises(ValueError, match="MIGRATE"):
+        list(iter_runtime_kv_p2p_transfers(plan, block_ids=(0,)))
 
 
 def test_runtime_kv_migration_plan_recomputes_when_capacity_is_insufficient():

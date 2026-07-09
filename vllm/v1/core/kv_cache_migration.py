@@ -82,6 +82,20 @@ class RuntimeKVSourceTensor:
 
 
 @dataclass(frozen=True)
+class RuntimeKVP2PTransfer:
+    source_rank: int
+    target_rank: int
+    source_pp_rank: int
+    source_tp_rank: int
+    target_pp_rank: int
+    target_tp_rank: int
+    layer_index: int
+    layer_name: str
+    block_ids: tuple[int, ...]
+    head_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class RuntimeKVBlockMappingPlan:
     block_mapping: dict[int, int]
     live_blocks: int
@@ -125,6 +139,113 @@ def get_runtime_topology_kv_rank(
     if tp_rank is None or pp_rank is None:
         raise ValueError(f"rank {rank} is not covered by topology layout")
     return pp_rank, tp_rank
+
+
+def get_runtime_topology_rank(
+    descriptor: TopologyDescriptor,
+    *,
+    pp_rank: int,
+    tp_rank: int,
+) -> int:
+    """Return the global rank for a logical ``(pp_rank, tp_rank)``."""
+    if pp_rank < 0 or pp_rank >= descriptor.pipeline_parallel_size:
+        raise ValueError(
+            "pp_rank must be in "
+            f"[0, {descriptor.pipeline_parallel_size}), got {pp_rank}"
+        )
+    if tp_rank < 0 or tp_rank >= descriptor.tensor_parallel_size:
+        raise ValueError(
+            "tp_rank must be in "
+            f"[0, {descriptor.tensor_parallel_size}), got {tp_rank}"
+        )
+
+    for rank in range(descriptor.world_size):
+        if get_runtime_topology_kv_rank(descriptor, rank=rank) == (
+            pp_rank,
+            tp_rank,
+        ):
+            return rank
+    raise ValueError(
+        f"logical rank pp={pp_rank}, tp={tp_rank} is not covered by "
+        "topology layout"
+    )
+
+
+def iter_runtime_kv_p2p_transfers(
+    plan: RuntimeKVMigrationPlan,
+    *,
+    block_ids: Sequence[int] | None = None,
+) -> Iterator[RuntimeKVP2PTransfer]:
+    """Yield source->target rank transfers for a GPU P2P KV data plane."""
+    if plan.policy != RuntimeKVMigrationPolicy.MIGRATE:
+        raise ValueError("runtime KV P2P transfer planning requires MIGRATE policy")
+    if not plan.layer_names:
+        raise ValueError("runtime KV P2P transfer planning requires layer names")
+    global_num_kv_heads = plan.global_num_kv_heads or max(
+        partition.head_indices.stop for partition in plan.tp_partitions
+    )
+    source_tp_size = plan.source_topology.tensor_parallel_size
+    if global_num_kv_heads % source_tp_size != 0:
+        raise ValueError(
+            "runtime KV P2P transfer planning requires KV heads to be "
+            "divisible by source tensor parallel size"
+        )
+    heads_per_source_rank = global_num_kv_heads // source_tp_size
+    transfer_block_ids = (
+        tuple(block_ids)
+        if block_ids is not None
+        else tuple(range(plan.live_blocks))
+    )
+
+    for pp_partition in plan.pp_partitions:
+        target_pp_rank = pp_partition.pp_rank
+        for layer_index in pp_partition.layer_indices:
+            layer_name = plan.layer_names[layer_index]
+            for target_head_partition in plan.tp_partitions:
+                target_tp_rank = target_head_partition.tp_rank
+                target_rank = get_runtime_topology_rank(
+                    plan.target_topology,
+                    pp_rank=target_pp_rank,
+                    tp_rank=target_tp_rank,
+                )
+                for source_rank in range(plan.source_topology.world_size):
+                    source_pp_rank, source_tp_rank = get_runtime_topology_kv_rank(
+                        plan.source_topology,
+                        rank=source_rank,
+                    )
+                    source_layer_start, source_layer_stop = get_pp_indices(
+                        len(plan.layer_names),
+                        source_pp_rank,
+                        plan.source_topology.pipeline_parallel_size,
+                    )
+                    if not source_layer_start <= layer_index < source_layer_stop:
+                        continue
+
+                    source_head_start = (
+                        source_tp_rank * heads_per_source_rank
+                    )
+                    source_head_stop = (
+                        source_head_start + heads_per_source_rank
+                    )
+                    head_indices = tuple(
+                        head_index
+                        for head_index in target_head_partition.head_indices
+                        if source_head_start <= head_index < source_head_stop
+                    )
+                    if not head_indices:
+                        continue
+                    yield RuntimeKVP2PTransfer(
+                        source_rank=source_rank,
+                        target_rank=target_rank,
+                        source_pp_rank=source_pp_rank,
+                        source_tp_rank=source_tp_rank,
+                        target_pp_rank=target_pp_rank,
+                        target_tp_rank=target_tp_rank,
+                        layer_index=layer_index,
+                        layer_name=layer_name,
+                        block_ids=transfer_block_ids,
+                        head_indices=head_indices,
+                    )
 
 
 def _layer_index(layer_name: str) -> int:
