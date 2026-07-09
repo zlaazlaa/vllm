@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+import json
 import os
 from pathlib import Path
 
@@ -123,6 +124,7 @@ def _make_llm(
     tensor_parallel_size: int,
     pipeline_parallel_size: int,
     use_cuda_graph: bool,
+    model_loader_extra_config: dict | None = None,
 ) -> LLM:
     kwargs = {}
     if use_cuda_graph:
@@ -142,8 +144,19 @@ def _make_llm(
         max_num_seqs=1,
         gpu_memory_utilization=0.30,
         dtype="float16",
+        model_loader_extra_config=model_loader_extra_config or {},
         **kwargs,
     )
+
+
+def _read_startup_profile_events(profile_dir: Path) -> list[dict]:
+    events = []
+    for profile_path in profile_dir.glob("startup_profile_*.jsonl"):
+        with profile_path.open() as profile_file:
+            for line in profile_file:
+                if line.strip():
+                    events.append(json.loads(line))
+    return events
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["eager", "cudagraph"])
@@ -265,3 +278,60 @@ def test_runtime_topology_switch_runs_consecutive_bidirectional_switches(
     finally:
         del llm
         gc.collect()
+
+
+def test_runtime_topology_switch_uses_host_weight_store_for_rebuild(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv(
+        "VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES",
+        "tp=1,pp=2",
+    )
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    profile_dir = tmp_path / "profiles"
+    monkeypatch.setenv("VLLM_STARTUP_PROFILING", "1")
+    monkeypatch.setenv("VLLM_STARTUP_PROFILE_DIR", str(profile_dir))
+
+    prompt = "The capital of France is"
+    llm = _make_llm(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+        use_cuda_graph=False,
+        model_loader_extra_config={
+            "host_weight_store_path": str(tmp_path / "shared-weights"),
+        },
+    )
+    try:
+        baseline = llm.generate([prompt], _sampling_params())[0]
+        baseline_token_ids = _generated_token_ids(baseline)
+        host_store_loads_before_switch = [
+            event
+            for event in _read_startup_profile_events(profile_dir)
+            if event.get("name") == "host_weight_store_iterator"
+        ]
+
+        result = llm.switch_runtime_topology(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+        )
+
+        assert result["model_materialization"] == {
+            "load_format": "host_weight_store",
+            "uses_host_weight_store": True,
+        }
+        _assert_topology(llm, tp=1, pp=2)
+        after = llm.generate([prompt], _sampling_params())[0]
+        assert _generated_token_ids(after) == baseline_token_ids
+    finally:
+        del llm
+        gc.collect()
+
+    events = _read_startup_profile_events(profile_dir)
+    host_store_loads = [
+        event
+        for event in events
+        if event.get("name") == "host_weight_store_iterator"
+    ]
+    assert len(host_store_loads) - len(host_store_loads_before_switch) >= 2

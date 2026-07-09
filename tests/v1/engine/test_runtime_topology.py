@@ -637,6 +637,49 @@ def test_engine_core_switch_runtime_topology_executes_kv_migration(
     ) in events
 
 
+@pytest.mark.parametrize(
+    ("load_format", "expected_uses_host_weight_store"),
+    [
+        ("host_weight_store", True),
+        ("auto", False),
+    ],
+)
+def test_engine_core_switch_runtime_topology_reports_model_materialization_source(
+    monkeypatch,
+    load_format,
+    expected_uses_host_weight_store,
+):
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+    events = []
+    config = make_config(tp=2, pp=1, world_size=2)
+    config.load_config = SimpleNamespace(
+        load_format=load_format,
+        model_loader_extra_config={"metadata_path": "/tmp/shared-weights.json"},
+    )
+    engine = EngineCore.__new__(EngineCore)
+    engine.vllm_config = config
+    engine.scheduler = FakeSwitchScheduler(events)
+    engine.model_executor = FakeSwitchExecutor(events)
+    engine._initialize_kv_caches = lambda vllm_config: make_kv_config()
+
+    def rebuild_scheduler(kv_cache_config, drained_requests):
+        engine.scheduler = FakeSwitchScheduler(events)
+
+    engine._rebuild_scheduler_for_runtime_topology = rebuild_scheduler
+
+    result = engine.switch_runtime_topology(
+        RuntimeTopologySwitchRequest(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+        )
+    )
+
+    assert result["model_materialization"] == {
+        "load_format": load_format,
+        "uses_host_weight_store": expected_uses_host_weight_store,
+    }
+
+
 def test_engine_core_switch_runtime_topology_clears_kv_snapshot_on_recompute(
     monkeypatch,
 ):

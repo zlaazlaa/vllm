@@ -325,6 +325,14 @@ class EngineCore:
             request.is_prefill_chunk = False
             request.kv_transfer_params = None
 
+    def _runtime_model_materialization_summary(self) -> dict[str, Any]:
+        load_config = getattr(self.vllm_config, "load_config", None)
+        load_format = getattr(load_config, "load_format", "unknown")
+        return {
+            "load_format": load_format,
+            "uses_host_weight_store": load_format == "host_weight_store",
+        }
+
     def _prepare_runtime_kv_migration(
         self,
         *,
@@ -588,6 +596,9 @@ class EngineCore:
         return {
             "previous": topology_descriptor_to_dict(plan.previous_topology),
             "target": topology_descriptor_to_dict(plan.target_topology),
+            "model_materialization": (
+                self._runtime_model_materialization_summary()
+            ),
             "kv_cache_migration": kv_cache_migration,
         }
 
