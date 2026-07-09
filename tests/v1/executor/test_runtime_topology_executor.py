@@ -206,6 +206,59 @@ def test_executor_migrates_runtime_kv_cache_via_cpu_staging():
     }
 
 
+def test_executor_migrates_runtime_kv_cache_via_p2p():
+    executor = _fake_executor()
+    plan = _p2p_migration_plan()
+    block_mapping = {3: 1, 5: 2}
+
+    def collective_rpc(method, timeout=None, args=(), kwargs=None, non_block=False):
+        executor.calls.append((method, timeout, args, kwargs, non_block))
+        assert method == "migrate_runtime_kv_cache_for_topology_p2p"
+        assert kwargs is not None
+        assert kwargs["source_block_ids"] == (3, 5)
+        assert kwargs["block_mapping"] == {0: 1, 1: 2}
+        assert kwargs["max_blocks_per_step"] == 2
+        batch_plan = kwargs["plan"]
+        assert batch_plan.source_topology == plan.source_topology
+        assert batch_plan.target_topology == plan.target_topology
+        assert batch_plan.live_blocks == 2
+        assert [
+            partition.layer_indices for partition in batch_plan.pp_partitions
+        ] == [range(0, 1)]
+        assert [
+            partition.head_indices for partition in batch_plan.tp_partitions
+        ] == [range(0, 4)]
+        return [
+            {
+                "migration_steps": 0,
+                "tensor_copies": 0,
+                "p2p_sends": 1,
+                "p2p_recvs": 0,
+            },
+            {
+                "migration_steps": 1,
+                "tensor_copies": 8,
+                "p2p_sends": 0,
+                "p2p_recvs": 1,
+            },
+        ]
+
+    executor.collective_rpc = collective_rpc
+
+    result = executor.migrate_runtime_kv_cache_for_topology_p2p(
+        plan=plan,
+        block_mapping=block_mapping,
+        max_blocks_per_step=2,
+    )
+
+    assert result == {
+        "migration_steps": 1,
+        "tensor_copies": 8,
+        "p2p_sends": 1,
+        "p2p_recvs": 1,
+    }
+
+
 def test_executor_streams_runtime_kv_source_one_layer_at_a_time():
     executor = _fake_executor()
     layer_names = tuple(f"model.layers.{i}.self_attn" for i in range(4))

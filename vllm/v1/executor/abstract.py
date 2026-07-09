@@ -436,6 +436,89 @@ class Executor(ABC):
             "source_shards": len(source_shard_keys),
         }
 
+    def migrate_runtime_kv_cache_for_topology_p2p(
+        self,
+        *,
+        plan: RuntimeKVMigrationPlan,
+        block_mapping: dict[int, int],
+        max_blocks_per_step: int = 1,
+    ) -> dict[str, int]:
+        if max_blocks_per_step < 1:
+            raise ValueError("max_blocks_per_step must be >= 1")
+
+        migration_steps = 0
+        tensor_copies = 0
+        p2p_sends = 0
+        p2p_recvs = 0
+        source_block_ids = tuple(block_mapping)
+
+        for pp_partition in plan.pp_partitions:
+            for layer_index in pp_partition.layer_indices:
+                layer_partition = RuntimeKVLayerPartition(
+                    pp_rank=pp_partition.pp_rank,
+                    layer_indices=range(layer_index, layer_index + 1),
+                )
+                block_batches = [
+                    source_block_ids[
+                        block_start : block_start + max_blocks_per_step
+                    ]
+                    for block_start in range(
+                        0,
+                        len(source_block_ids),
+                        max_blocks_per_step,
+                    )
+                ] or [()]
+                for block_ids in block_batches:
+                    batch_block_mapping = {
+                        local_block_id: block_mapping[source_block_id]
+                        for local_block_id, source_block_id in enumerate(
+                            block_ids
+                        )
+                    }
+                    for tp_partition in plan.tp_partitions:
+                        head_partition = RuntimeKVHeadPartition(
+                            tp_rank=tp_partition.tp_rank,
+                            head_indices=range(
+                                tp_partition.head_indices.start,
+                                tp_partition.head_indices.stop,
+                            ),
+                        )
+                        batch_plan = replace(
+                            plan,
+                            pp_partitions=[layer_partition],
+                            tp_partitions=[head_partition],
+                            live_blocks=len(block_ids),
+                        )
+                        worker_stats = self.collective_rpc(
+                            "migrate_runtime_kv_cache_for_topology_p2p",
+                            kwargs=dict(
+                                plan=batch_plan,
+                                block_mapping=batch_block_mapping,
+                                source_block_ids=block_ids,
+                                max_blocks_per_step=max_blocks_per_step,
+                            ),
+                        )
+                        migration_steps += sum(
+                            int(stats["migration_steps"])
+                            for stats in worker_stats
+                        )
+                        tensor_copies += sum(
+                            int(stats["tensor_copies"]) for stats in worker_stats
+                        )
+                        p2p_sends += sum(
+                            int(stats["p2p_sends"]) for stats in worker_stats
+                        )
+                        p2p_recvs += sum(
+                            int(stats["p2p_recvs"]) for stats in worker_stats
+                        )
+
+        return {
+            "migration_steps": migration_steps,
+            "tensor_copies": tensor_copies,
+            "p2p_sends": p2p_sends,
+            "p2p_recvs": p2p_recvs,
+        }
+
     @abstractmethod
     def check_health(self) -> None:
         """Checks if the executor is healthy. If not, it should raise an
