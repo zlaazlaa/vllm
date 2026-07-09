@@ -18,12 +18,14 @@ from vllm.distributed.topology_cache import (
 class RuntimeTopologySwitchRequest:
     tensor_parallel_size: int
     pipeline_parallel_size: int
+    max_kv_migration_blocks_per_step: int = 1
 
 
 @dataclass(frozen=True)
 class RuntimeTopologySwitchPlan:
     previous_topology: TopologyDescriptor
     target_topology: TopologyDescriptor
+    max_kv_migration_blocks_per_step: int = 1
 
 
 @dataclass(frozen=True)
@@ -274,6 +276,8 @@ def validate_runtime_topology_switch(
     prebuilt_topology_keys: set[tuple[int, int, int, int, int, int]] | None = None,
 ) -> RuntimeTopologySwitchPlan:
     _reject_unsupported_features(vllm_config)
+    if request.max_kv_migration_blocks_per_step < 1:
+        raise ValueError("max_kv_migration_blocks_per_step must be >= 1")
 
     previous = _current_topology(vllm_config)
     try:
@@ -300,4 +304,7 @@ def validate_runtime_topology_switch(
     return RuntimeTopologySwitchPlan(
         previous_topology=previous,
         target_topology=target,
+        max_kv_migration_blocks_per_step=(
+            request.max_kv_migration_blocks_per_step
+        ),
     )

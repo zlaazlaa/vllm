@@ -980,10 +980,12 @@ class AsyncLLM(EngineClient):
         *,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
+        max_kv_migration_blocks_per_step: int = 1,
     ) -> dict[str, dict[str, int]]:
         return await self.engine_core.switch_runtime_topology_async(
             tensor_parallel_size,
             pipeline_parallel_size,
+            max_kv_migration_blocks_per_step,
         )
 
     async def recommend_runtime_topology(self) -> dict[str, Any]:

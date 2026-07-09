@@ -208,6 +208,20 @@ def test_validate_rejects_target_world_size_change(monkeypatch):
         )
 
 
+def test_validate_rejects_invalid_runtime_kv_migration_batch_size(monkeypatch):
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+
+    with pytest.raises(ValueError, match="max_kv_migration_blocks_per_step"):
+        validate_runtime_topology_switch(
+            make_config(tp=2, pp=1, world_size=2),
+            RuntimeTopologySwitchRequest(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=2,
+                max_kv_migration_blocks_per_step=0,
+            ),
+        )
+
+
 def test_recommend_runtime_topology_prefers_tp_for_low_concurrency(monkeypatch):
     monkeypatch.setenv(
         "VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES",
@@ -637,6 +651,50 @@ def test_engine_core_switch_runtime_topology_executes_kv_migration(
     ) in events
 
 
+def test_engine_core_switch_runtime_topology_uses_requested_kv_migration_batch_size(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_PREBUILD_MODEL_PARALLEL_TOPOLOGIES", "tp=1,pp=2")
+    events = []
+    config = make_config(tp=2, pp=1, world_size=2)
+    engine = EngineCore.__new__(EngineCore)
+    engine.vllm_config = config
+    engine.scheduler = FakeSwitchScheduler(events)
+    engine.scheduler.collect_runtime_kv_block_ids = lambda: {
+        "req-0": [2, 4, 7],
+    }
+    engine.model_executor = FakeSwitchExecutor(events)
+    engine._initialize_kv_caches = lambda vllm_config: make_kv_config(
+        num_blocks=8
+    )
+
+    def rebuild_scheduler(kv_cache_config, drained_requests):
+        engine.scheduler = FakeSwitchScheduler(events)
+
+    engine._rebuild_scheduler_for_runtime_topology = rebuild_scheduler
+
+    result = engine.switch_runtime_topology(
+        RuntimeTopologySwitchRequest(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=2,
+            max_kv_migration_blocks_per_step=3,
+        )
+    )
+
+    target = TopologyDescriptor(
+        world_size=2,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+    )
+    assert (
+        "migrate_kv",
+        target,
+        {2: 2, 4: 4, 7: 7},
+        3,
+    ) in events
+    assert result["kv_cache_migration"]["max_blocks_per_step"] == 3
+
+
 @pytest.mark.parametrize(
     ("load_format", "expected_uses_host_weight_store"),
     [
@@ -837,21 +895,26 @@ def test_engine_core_recommend_runtime_topology_uses_scheduler_load(monkeypatch)
 def test_llm_engine_switch_runtime_topology_delegates_to_core_client():
     calls = []
     engine = LLMEngine.__new__(LLMEngine)
-    engine.engine_core = SimpleNamespace(
-        switch_runtime_topology=lambda tp, pp: calls.append((tp, pp)) or {
+    def switch_runtime_topology(tp, pp, max_blocks_per_step=1):
+        calls.append((tp, pp, max_blocks_per_step))
+        return {
             "target": {
                 "tensor_parallel_size": tp,
                 "pipeline_parallel_size": pp,
             }
         }
+
+    engine.engine_core = SimpleNamespace(
+        switch_runtime_topology=switch_runtime_topology
     )
 
     result = engine.switch_runtime_topology(
         tensor_parallel_size=1,
         pipeline_parallel_size=2,
+        max_kv_migration_blocks_per_step=4,
     )
 
-    assert calls == [(1, 2)]
+    assert calls == [(1, 2, 4)]
     assert result["target"]["pipeline_parallel_size"] == 2
 
 
@@ -936,12 +999,17 @@ def test_sync_mp_client_switch_runtime_topology_sends_msgpack_safe_dict():
     result = client.switch_runtime_topology(
         tensor_parallel_size=1,
         pipeline_parallel_size=2,
+        max_kv_migration_blocks_per_step=4,
     )
 
     assert sent == [
         (
             "switch_runtime_topology",
-            {"tensor_parallel_size": 1, "pipeline_parallel_size": 2},
+            {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 2,
+                "max_kv_migration_blocks_per_step": 4,
+            },
         )
     ]
     assert result["target"]["pipeline_parallel_size"] == 2
@@ -976,13 +1044,18 @@ def test_async_mp_client_switch_runtime_topology_sends_msgpack_safe_dict():
         client.switch_runtime_topology_async(
             tensor_parallel_size=1,
             pipeline_parallel_size=2,
+            max_kv_migration_blocks_per_step=4,
         )
     )
 
     assert sent == [
         (
             "switch_runtime_topology",
-            {"tensor_parallel_size": 1, "pipeline_parallel_size": 2},
+            {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 2,
+                "max_kv_migration_blocks_per_step": 4,
+            },
         )
     ]
     assert result["target"]["pipeline_parallel_size"] == 2

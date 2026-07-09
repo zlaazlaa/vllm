@@ -72,10 +72,12 @@ EngineIdentity = bytes
 def _runtime_topology_switch_payload(
     tensor_parallel_size: int,
     pipeline_parallel_size: int,
+    max_kv_migration_blocks_per_step: int = 1,
 ) -> dict[str, int]:
     return {
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
+        "max_kv_migration_blocks_per_step": max_kv_migration_blocks_per_step,
     }
 
 
@@ -216,6 +218,7 @@ class EngineCoreClient(ABC):
         self,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
+        max_kv_migration_blocks_per_step: int = 1,
     ) -> dict[str, dict[str, int]]:
         raise NotImplementedError
 
@@ -297,6 +300,7 @@ class EngineCoreClient(ABC):
         self,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
+        max_kv_migration_blocks_per_step: int = 1,
     ) -> dict[str, dict[str, int]]:
         raise NotImplementedError
 
@@ -397,11 +401,15 @@ class InprocClient(EngineCoreClient):
         self,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
+        max_kv_migration_blocks_per_step: int = 1,
     ) -> dict[str, dict[str, int]]:
         return self.engine_core.switch_runtime_topology(
             RuntimeTopologySwitchRequest(
                 tensor_parallel_size=tensor_parallel_size,
                 pipeline_parallel_size=pipeline_parallel_size,
+                max_kv_migration_blocks_per_step=(
+                    max_kv_migration_blocks_per_step
+                ),
             )
         )
 
@@ -991,12 +999,14 @@ class SyncMPClient(MPClient):
         self,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
+        max_kv_migration_blocks_per_step: int = 1,
     ) -> dict[str, dict[str, int]]:
         return self.call_utility(
             "switch_runtime_topology",
             _runtime_topology_switch_payload(
                 tensor_parallel_size,
                 pipeline_parallel_size,
+                max_kv_migration_blocks_per_step,
             ),
         )
 
@@ -1262,12 +1272,14 @@ class AsyncMPClient(MPClient):
         self,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
+        max_kv_migration_blocks_per_step: int = 1,
     ) -> dict[str, dict[str, int]]:
         return await self.call_utility_async(
             "switch_runtime_topology",
             _runtime_topology_switch_payload(
                 tensor_parallel_size,
                 pipeline_parallel_size,
+                max_kv_migration_blocks_per_step,
             ),
         )
 

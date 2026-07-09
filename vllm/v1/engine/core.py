@@ -348,6 +348,9 @@ class EngineCore:
                 "reason": "kv_block_snapshot_unavailable",
                 "live_blocks": 0,
                 "target_num_blocks": target_num_blocks,
+                "max_blocks_per_step": (
+                    switch_plan.max_kv_migration_blocks_per_step
+                ),
                 "detail": snapshot_error,
             }
             self._runtime_kv_migration_preparation = {
@@ -363,6 +366,9 @@ class EngineCore:
                 "reason": "no_live_blocks",
                 "live_blocks": 0,
                 "target_num_blocks": target_num_blocks,
+                "max_blocks_per_step": (
+                    switch_plan.max_kv_migration_blocks_per_step
+                ),
             }
             self._runtime_kv_migration_preparation = {
                 "summary": summary,
@@ -392,6 +398,9 @@ class EngineCore:
                 "reason": reason,
                 "live_blocks": live_blocks,
                 "target_num_blocks": kv_cache_config.num_blocks,
+                "max_blocks_per_step": (
+                    switch_plan.max_kv_migration_blocks_per_step
+                ),
                 "detail": str(e),
             }
             self._runtime_kv_migration_preparation = {
@@ -405,6 +414,9 @@ class EngineCore:
             "reason": kv_migration_plan.reason,
             "live_blocks": block_mapping.live_blocks,
             "target_num_blocks": kv_migration_plan.target_num_blocks,
+            "max_blocks_per_step": (
+                switch_plan.max_kv_migration_blocks_per_step
+            ),
         }
         self._runtime_kv_migration_preparation = {
             "summary": summary,
@@ -539,7 +551,9 @@ class EngineCore:
                         self.model_executor.migrate_runtime_kv_cache_for_topology(
                             plan=migration_prep["plan"],
                             block_mapping=migration_prep["block_mapping"],
-                            max_blocks_per_step=1,
+                            max_blocks_per_step=(
+                                plan.max_kv_migration_blocks_per_step
+                            ),
                         )
                     )
                     kv_cache_migration.update(migration_stats)
@@ -557,6 +571,9 @@ class EngineCore:
                         "live_blocks": kv_cache_migration["live_blocks"],
                         "target_num_blocks": kv_cache_migration[
                             "target_num_blocks"
+                        ],
+                        "max_blocks_per_step": kv_cache_migration[
+                            "max_blocks_per_step"
                         ],
                         "detail": str(e),
                     }
@@ -607,6 +624,9 @@ class EngineCore:
                         "live_blocks": kv_cache_migration["live_blocks"],
                         "target_num_blocks": kv_cache_migration[
                             "target_num_blocks"
+                        ],
+                        "max_blocks_per_step": kv_cache_migration[
+                            "max_blocks_per_step"
                         ],
                         "detail": str(e),
                     }

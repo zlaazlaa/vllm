@@ -809,10 +809,14 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         *,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
+        max_kv_migration_blocks_per_step: int = 1,
     ) -> dict[str, dict[str, int]]:
         return self.llm_engine.switch_runtime_topology(
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            max_kv_migration_blocks_per_step=(
+                max_kv_migration_blocks_per_step
+            ),
         )
 
     def recommend_runtime_topology(self) -> dict[str, Any]:
